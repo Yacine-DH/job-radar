@@ -66,15 +66,21 @@ RANK_BATCH = 12
 CLAUDE_MODEL = "sonnet"
 
 PROFILE_PATH = HERE / "profile.md"  # optional: overrides PROFILE below, edit without touching code
+CV_DIR = HERE / "cv"
+CV_TEX = CV_DIR / "cv-content.tex"      # master CV (git-ignored, personal data)
+CV_PROFILE_PATH = CV_DIR / "profile.md"  # distilled by `cv.py build`, contact details stripped
 PROFILE = (
-    "Candidate: Bachelor/Master computer science student at TU Darmstadt with frontend "
-    "experience (web, JavaScript/TypeScript, UI). Can work at most 20 hours per week "
+    "Candidate: computer science student at TU Darmstadt. Can work at most 20 hours per week "
     "during the semester, so full-time roles or roles requiring more than 20 h/week "
     "are a poor fit. Lives in Darmstadt; commute within ~30 km is fine, on-site or hybrid."
 )
 
 if PROFILE_PATH.exists():
     PROFILE = PROFILE_PATH.read_text().strip()
+elif CV_PROFILE_PATH.exists():
+    PROFILE += "\n\nCV summary (the only source of truth about the candidate's skills):\n" + CV_PROFILE_PATH.read_text().strip()
+else:
+    PROFILE += " Has frontend experience (web, JavaScript/TypeScript, UI)."
 
 # --- relevance filters ------------------------------------------------------
 
@@ -412,6 +418,12 @@ def open_db() -> sqlite3.Connection:
         db.execute("ALTER TABLE jobs ADD COLUMN status TEXT NOT NULL DEFAULT 'new'")
     if "status_at" not in cols:
         db.execute("ALTER TABLE jobs ADD COLUMN status_at TEXT")
+    if "cv_track" not in cols:
+        db.execute("ALTER TABLE jobs ADD COLUMN cv_track TEXT")  # swe | devops | ml: best-fitting CV variant
+    if "gaps" not in cols:
+        db.execute("ALTER TABLE jobs ADD COLUMN gaps TEXT")  # JSON list: skills the posting wants, CV lacks
+    db.execute("""CREATE TABLE IF NOT EXISTS tailoring (
+        job_id TEXT PRIMARY KEY, created TEXT DEFAULT CURRENT_TIMESTAMP, track TEXT, markdown TEXT)""")
     if "distance_km" not in cols:
         db.execute("ALTER TABLE jobs ADD COLUMN distance_km REAL")
         for r in db.execute("SELECT id, description FROM jobs WHERE source = 'BA'").fetchall():
@@ -477,8 +489,21 @@ def feedback_block(db: sqlite3.Connection, per_class: int = 8) -> str:
     return "\n".join(out) + "\n\n"
 
 
-def rank(jobs: list[sqlite3.Row], feedback: str = "") -> dict[str, tuple[int, str]]:
-    results: dict[str, tuple[int, str]] = {}
+def ask_claude(prompt: str, system: str = SYSTEM_PROMPT, timeout: int = 300) -> str:
+    """One tool-less `claude -p` call; job and CV text are data, so no tools are exposed."""
+    proc = subprocess.run(
+        ["claude", "-p", "--model", CLAUDE_MODEL, "--tools", "", "--no-session-persistence",
+         "--system-prompt", system],
+        input=prompt, capture_output=True, text=True, timeout=timeout, check=True)
+    return proc.stdout
+
+
+TRACKS = ("swe", "devops", "ml")
+
+
+def rank(jobs: list[sqlite3.Row], feedback: str = "") -> dict[str, tuple[int, str, str | None, str]]:
+    """id -> (score, reason, best CV track, JSON list of missing skills)."""
+    results: dict[str, tuple[int, str, str | None, str]] = {}
     for i in range(0, len(jobs), RANK_BATCH):
         batch = jobs[i:i + RANK_BATCH]
         listing = "\n\n".join(
@@ -486,24 +511,33 @@ def rank(jobs: list[sqlite3.Row], feedback: str = "") -> dict[str, tuple[int, st
             f"Location: {j['location']}\nDetails: {(j['description'] or '')[:1500]}\n</job>"
             for j in batch)
         prompt = (
-            f"{PROFILE}\n\n{feedback}Score each job 0-100 for fit (CS relevance, frontend/web closeness, "
-            "learning value, plausible at <=20 h/week). Penalise full-time-only roles and non-CS work. "
+            f"{PROFILE}\n\n{feedback}Score each job 0-100 for fit: how well it matches the candidate's actual "
+            "skills and projects, CS relevance, learning value, and whether it is plausible at <=20 h/week. "
+            "Penalise full-time-only roles and non-CS work. Never credit a skill the CV summary does not state. "
             "Use the full range: 80+ = apply immediately, 60-79 = worth a look, 40-59 = marginal, <40 = skip. "
             "Mention the deciding factor in the reason (stack, hours, task type, company).\n"
-            'Output a JSON array: [{"id": "...", "score": 0-100, "reason": "max 15 words, English"}], '
+            'Output a JSON array: [{"id": "...", "score": 0-100, "reason": "max 15 words, English", '
+            '"track": "swe|devops|ml (best-fitting CV variant)", '
+            '"gaps": ["up to 3 skills the posting asks for that the CV lacks, empty if none"]}], '
             "one entry per job, nothing else.\n\n" + listing)
         try:
-            proc = subprocess.run(
-                ["claude", "-p", "--model", CLAUDE_MODEL, "--tools", "", "--no-session-persistence",
-                 "--system-prompt", SYSTEM_PROMPT],
-                input=prompt, capture_output=True, text=True, timeout=300, check=True)
-            text = proc.stdout
+            text = ask_claude(prompt)
             arr = json.loads(text[text.index("["): text.rindex("]") + 1])
             for e in arr:
-                results[str(e["id"])] = (max(0, min(100, int(e["score"]))), str(e.get("reason", ""))[:200])
+                track = str(e.get("track", "")).lower()
+                gaps = [str(g)[:40] for g in (e.get("gaps") or [])][:3]
+                results[str(e["id"])] = (max(0, min(100, int(e["score"]))), str(e.get("reason", ""))[:200],
+                                         track if track in TRACKS else None, json.dumps(gaps, ensure_ascii=False))
         except (subprocess.SubprocessError, ValueError, KeyError, TypeError) as e:
             log(f"ranking batch {i // RANK_BATCH + 1} failed: {e}")
     return results
+
+
+def save_scores(db: sqlite3.Connection, scores: dict) -> None:
+    for jid, (score, reason, track, gaps) in scores.items():
+        db.execute("UPDATE jobs SET score=?, reason=?, cv_track=?, gaps=? WHERE id=?",
+                   (score, reason, track, gaps, jid))
+    db.commit()
 
 
 # --- Telegram ----------------------------------------------------------------
@@ -518,6 +552,20 @@ def load_env() -> None:
 
 def _dist(r: sqlite3.Row) -> str:
     return f"{r['distance_km']:g} km" if r["distance_km"] is not None else "–"
+
+
+def cv_hint(r: sqlite3.Row) -> str:
+    """'CV: devops · missing: Kubernetes, Terraform' (empty when the job has not been CV-ranked)."""
+    parts = []
+    if r["cv_track"]:
+        parts.append(f"CV: {r['cv_track']}")
+    try:
+        gaps = json.loads(r["gaps"] or "[]")
+    except ValueError:
+        gaps = []
+    if gaps:
+        parts.append("missing: " + ", ".join(gaps))
+    return " · ".join(parts)
 
 
 def _score_color(score: int) -> str:
@@ -556,7 +604,7 @@ def build_email(rows: list[sqlite3.Row], total_new: int, failed: list[str] = (),
   <div style="color:#57606a;font-size:13px;margin-top:6px">{esc(summary)}</div></td></tr>""")
     for r in rows:
         text.append(f"[{r['score']}] {r['title']}\n  {r['company']} · {r['location']} · {_dist(r)}\n"
-                    f"  {r['reason'] or ''}\n  {r['url']}\n")
+                    f"  {r['reason'] or ''}\n" + (f"  {cv_hint(r)}\n" if cv_hint(r) else "") + f"  {r['url']}\n")
         cards.append(f"""
 <tr><td style="padding:14px 16px;border-bottom:1px solid #e5e7eb">
   <table role="presentation" width="100%" cellspacing="0" cellpadding="0"><tr>
@@ -567,6 +615,7 @@ def build_email(rows: list[sqlite3.Row], total_new: int, failed: list[str] = (),
       <div style="color:#24292f;font-size:14px;margin-top:3px">{esc(r['company'])}</div>
       <div style="color:#57606a;font-size:13px;margin-top:2px">{esc(r['location'])} · {_dist(r)} · {esc(r['source'])}</div>
       <div style="color:#57606a;font-size:13px;margin-top:6px;font-style:italic">{esc(r['reason'] or '')}</div>
+      {f'<div style="color:#0969da;font-size:12px;margin-top:6px">{esc(cv_hint(r))}</div>' if cv_hint(r) else ''}
     </td></tr></table>
 </td></tr>""")
     credit = "Sources: Bundesagentur für Arbeit, Stellenwerk, Merck, Arbeitnow, SmartRecruiters"
@@ -617,9 +666,7 @@ def main() -> int:
     if args.rescore:
         rows = db.execute("SELECT * FROM jobs WHERE status = 'new'").fetchall()
         scores = rank(rows, feedback_block(db))
-        for jid, (score, reason) in scores.items():
-            db.execute("UPDATE jobs SET score=?, reason=? WHERE id=?", (score, reason, jid))
-        db.commit()
+        save_scores(db, scores)
         log(f"rescored {len(scores)}/{len(rows)} jobs")
         return 0
     fetched, failed = [], []
@@ -638,9 +685,7 @@ def main() -> int:
     ranked = []
     if pending:
         scores = {} if args.no_rank else rank([r for r in pending if r["score"] is None], feedback_block(db))
-        for jid, (score, reason) in scores.items():
-            db.execute("UPDATE jobs SET score=?, reason=? WHERE id=?", (score, reason, jid))
-        db.commit()
+        save_scores(db, scores)
         pending = db.execute("SELECT * FROM jobs WHERE notified = 0 ORDER BY score DESC").fetchall()
         # Unranked rows (claude failure) stay pending and are retried tomorrow.
         ranked = [r for r in pending if r["score"] is not None]

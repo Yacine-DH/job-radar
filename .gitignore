@@ -3,3 +3,6 @@
 jobs.db
 __pycache__/
 .venv/
+.orca/
+cv/
+profile.md

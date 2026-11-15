@@ -4,6 +4,7 @@
 Binds only to a Tailscale (or loopback) address; refuses anything else.
 """
 import html
+import re
 import ipaddress
 import os
 import secrets
@@ -97,6 +98,18 @@ def safe_url(u: str) -> str:
     return u if urlsplit(u or "").scheme in ("http", "https") else "#"
 
 
+def render_md(md: str) -> str:
+    """Tiny, safe markdown subset for the tailoring text: escape first, then headings and **bold**."""
+    out = []
+    for line in md.splitlines():
+        line = html.escape(line)
+        if line.startswith("## "):
+            out.append(f"<h4>{line[3:]}</h4>")
+        else:
+            out.append(re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", line))
+    return '<div class="md">' + "\n".join(out) + "</div>"
+
+
 def render_card(r: sqlite3.Row) -> str:
     e = html.escape
     score = r["score"]
@@ -107,6 +120,12 @@ def render_card(r: sqlite3.Row) -> str:
         for k, v in STATUSES.items())
     desc = (r["description"] or "").strip()
     more = f"<details><summary>Details</summary><p>{e(desc[:2000])}</p></details>" if desc else ""
+    hint = radar.cv_hint(r)
+    cv_line = f'<div class="cv">{e(hint)}</div>' if hint else ""
+    if r["tailoring_md"]:
+        tailor = f'<details class="tailor"><summary>Tailoring</summary>{render_md(r["tailoring_md"])}</details>'
+    else:
+        tailor = f'<div class="cmd">Tailor: <code>python3 -I cv.py tailor {e(r["id"])}</code></div>'
     return f"""<article class="card" data-id="{e(r['id'], quote=True)}" data-status="{e(r['status'], quote=True)}">
   <div class="score {cls}">{'–' if score is None else score}</div>
   <div class="main">
@@ -114,7 +133,9 @@ def render_card(r: sqlite3.Row) -> str:
     <div class="meta">{e(r['company'] or '')}</div>
     <div class="meta sub">{e(r['location'] or '')} · {dist} · {e(r['source'] or '')} · {e((r['first_seen'] or '')[:10])}</div>
     <div class="reason">{e(r['reason'] or '')}</div>
+    {cv_line}
     {more}
+    {tailor}
     <div class="status" role="group" aria-label="Status">{buttons}</div>
   </div>
 </article>"""
@@ -138,6 +159,9 @@ input[type=range]{padding:0;accent-color:var(--accent)}
 .main{min-width:0;flex:1}.title{color:var(--accent);font-weight:600;text-decoration:none;overflow-wrap:anywhere}
 .meta{font-size:14px;margin-top:2px;overflow-wrap:anywhere}.sub{color:var(--muted);font-size:13px}
 .reason{font-size:13px;color:var(--muted);font-style:italic;margin-top:6px}
+.cv{font-size:12px;color:var(--accent);margin-top:6px;overflow-wrap:anywhere}
+.cmd{font-size:12px;color:var(--muted);margin-top:6px;overflow-wrap:anywhere}.cmd code{user-select:all}
+.md{white-space:pre-wrap;overflow-wrap:anywhere;color:var(--fg);line-height:1.5}.md h4{margin:10px 0 2px;font-size:14px}
 details{margin-top:6px;font-size:13px;color:var(--muted)}summary{cursor:pointer;min-height:24px}details p{white-space:pre-wrap;overflow-wrap:anywhere}
 .status{display:grid;grid-template-columns:repeat(2,1fr);gap:6px;margin-top:10px}
 @media(min-width:560px){.status{grid-template-columns:repeat(4,1fr)}}
@@ -189,7 +213,8 @@ def index(request: Request, min_score: int = Query(0, ge=0, le=100),
         where.append("status = ?"); args.append(status)
     with db() as con:
         rows = con.execute(
-            f"SELECT * FROM jobs WHERE {' AND '.join(where)} "
+            "SELECT jobs.*, t.markdown AS tailoring_md FROM jobs LEFT JOIN tailoring t ON t.job_id = jobs.id "
+            f"WHERE {' AND '.join(where)} "
             f"ORDER BY {order}, id", args).fetchall()
         total = con.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
         counts = dict(con.execute("SELECT status, COUNT(*) FROM jobs GROUP BY status").fetchall())
