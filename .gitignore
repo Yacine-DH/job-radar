@@ -1,0 +1,5 @@
+.env*
+!.env.example
+jobs.db
+__pycache__/
+.venv/

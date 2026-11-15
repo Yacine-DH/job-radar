@@ -1,0 +1,9 @@
+[Unit]
+Description=Run job radar Monday to Friday at 08:00 Berlin time
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 08:00:00 Europe/Berlin
+Persistent=true
+
+[Install]
+WantedBy=timers.target
