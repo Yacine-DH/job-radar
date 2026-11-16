@@ -20,11 +20,14 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime
 from email.message import EmailMessage
 from html.parser import HTMLParser
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 HERE = Path(__file__).resolve().parent
+BERLIN = ZoneInfo("Europe/Berlin")
 DB_PATH = HERE / "jobs.db"
 ENV_PATH = HERE / ".env"
 
@@ -61,8 +64,9 @@ NEARBY_TOWNS = re.compile(
 SOURCES_CONFIG = HERE / "sources.json"  # {"smartrecruiters": ["CompanyIdentifier", ...]}
 SR_URL = "https://api.smartrecruiters.com/v1/companies"
 
+SOURCE_NAMES = ("BA", "Stellenwerk", "Merck", "Arbeitnow", "SmartRecruiters")  # shown by the dashboard
 TOP_N = 10
-MIN_SCORE = 40
+MIN_SCORE = 50  # jobs below this are counted in the email but not shown as cards
 RANK_BATCH = 12
 CLAUDE_MODEL = "sonnet"
 
@@ -433,6 +437,8 @@ def open_db() -> sqlite3.Connection:
     db.execute("""CREATE TABLE IF NOT EXISTS tailoring (
         job_id TEXT PRIMARY KEY, created TEXT DEFAULT CURRENT_TIMESTAMP, track TEXT, markdown TEXT)""")
     # Work queue for the dashboard's "Tailor resume" button; worker.py processes it.
+    db.execute("""CREATE TABLE IF NOT EXISTS runs (
+        id INTEGER PRIMARY KEY, ts TEXT DEFAULT CURRENT_TIMESTAMP, counts TEXT, failed TEXT)""")
     db.execute("""CREATE TABLE IF NOT EXISTS tailor_jobs (
         job_id TEXT PRIMARY KEY, state TEXT NOT NULL, requested TEXT DEFAULT CURRENT_TIMESTAMP,
         finished TEXT, error TEXT, pdf INTEGER NOT NULL DEFAULT 0, warnings TEXT)""")
@@ -586,68 +592,156 @@ def cv_hint(r: sqlite3.Row) -> str:
     return " · ".join(parts)
 
 
-def _score_color(score: int) -> str:
-    return "#1a7f37" if score >= 70 else "#9a6700" if score >= 50 else "#6e7781"
+def _score_color(score) -> str:
+    """Solid fills with white text (all >= 4.5:1): they survive dark-mode inversion in mail clients."""
+    return "#6e7781" if score is None else "#1a7f37" if score >= 70 else "#9a6700" if score >= 50 else "#6e7781"
 
 
-def build_email(rows: list[sqlite3.Row], total_new: int, failed: list[str] = (),
-                summary: str = "") -> tuple[str, str, str]:
-    """Return (subject, plain text, HTML). Inline styles only: Gmail drops most <style> blocks.
+SOURCE_LABELS = {"BA": "Bundesagentur für Arbeit (BA)", "Stellenwerk": "Stellenwerk Darmstadt",
+                 "Merck": "Merck Careers", "Arbeitnow": "Arbeitnow", "SmartRecruiters": "SmartRecruiters"}
 
-    With no rows it builds the "nothing new today" heartbeat, so a daily email still arrives."""
+
+def _src(name: str) -> str:
+    return SOURCE_LABELS.get(name, name)
+
+
+def build_email(rows: list[sqlite3.Row], total_new: int, failed: list[str] = (), errors: dict | None = None,
+                stats: dict | None = None) -> tuple[str, str, str]:
+    """Return (subject, plain text, HTML) for the three digest variants: normal, nothing new, source failed.
+
+    Tables and inline styles only (Gmail drops most <style> blocks), 640 px, no images, solid-colour badges.
+    `rows` are the jobs worth showing (score >= MIN_SCORE, at most TOP_N); `total_new` counts every new job."""
     esc = html.escape
-    if rows:
-        subject = f"Job radar: {total_new} new, top score {rows[0]['score']}"
-        subtitle = f"{total_new} new Werkstudent jobs near Darmstadt · top {len(rows)} by fit"
-    else:
-        subject = "Job radar: nothing new today"
-        subtitle = "No new matching jobs today" + (f" ({total_new} new ones scored too low)" if total_new else "")
-    if failed:
-        subject += " ⚠ source errors"
+    errors, stats, failed = errors or {}, stats or {}, list(failed)
+    now = datetime.now(BERLIN)
+    day = f"{now.strftime('%a')} {now.day} {now.strftime('%b')}"
+    n_src = stats.get("sources", len(SOURCE_NAMES))
+    tracked, interested, applied = stats.get("tracked", 0), stats.get("interested", 0), stats.get("applied", 0)
     dash = os.environ.get("DASHBOARD_URL", "").strip()
-    text = [f"Job radar: {subtitle}\n"]
+    fail_suffix = f" ({len(failed)} source{'s' if len(failed) != 1 else ''} failed)" if failed else ""
+    ok_n = n_src - len(failed)
+
+    if rows:
+        subject = f"Job Radar: {total_new} new, top {rows[0]['score']}{fail_suffix}"
+        headline = f"{total_new} new job{'s' if total_new != 1 else ''}, top score {rows[0]['score']}"
+        n70 = sum(1 for r in rows if r["score"] >= 70)
+        sub = (f"{ok_n} of {n_src} sources OK · {tracked} tracked" if failed else
+               " · ".join(([f"{n70} score 70+"] if n70 else []) + [f"{tracked} tracked", f"{interested} interested", f"{applied} applied"]))
+        intro = ""
+    else:
+        subject = f"Job Radar: nothing new today{fail_suffix}"
+        headline, sub = "Nothing new today", ""
+        checked = f"All {n_src} sources were" if not failed else f"{ok_n} of {n_src} sources were"
+        why = (f"{total_new} new posting{'s' if total_new != 1 else ''} scored below {MIN_SCORE}; they are on the dashboard."
+               if total_new else "no new postings passed the filters.")
+        intro = f"{checked} checked at {now:%H:%M}; {why}" + ("" if failed else " The radar is running fine.")
+
+    # --- plain text
+    text = [f"Job Radar · {day}", headline + (f" ({sub})" if sub else "")]
+    if intro:
+        text.append(intro)
     if failed:
-        text.append(f"WARNING: these sources failed today and may have been missed: {', '.join(failed)}\n")
-    if not rows and summary:
-        text.append(f"{summary}\n")
-    cards = []
-    if failed:
-        cards.append(f"""
-<tr><td style="padding:12px 16px;background:#fff8c5;border-bottom:1px solid #e5e7eb;color:#6a5300;font-size:13px">
-  ⚠ These sources failed today and may have been missed: <b>{esc(', '.join(failed))}</b>. Check <code>journalctl --user -u job-radar</code>.
-</td></tr>""")
-    if not rows:
-        cards.append(f"""
-<tr><td style="padding:20px 16px;color:#24292f;font-size:14px">Nothing new worth your time today.
-  <div style="color:#57606a;font-size:13px;margin-top:6px">{esc(summary)}</div></td></tr>""")
+        text.append("WARNING: " + "; ".join(f"{_src(n)} couldn't be fetched ({errors.get(n, 'error')})" for n in failed)
+                    + ". Today's list may be missing jobs; the radar will retry tomorrow.")
+    text.append("")
     for r in rows:
-        text.append(f"[{r['score']}] {r['title']}\n  {r['company']} · {r['location']} · {_dist(r)}\n"
+        where_txt = " · ".join(x for x in (r["company"], r["location"], _dist(r) if r["distance_km"] is not None else "", r["source"]) if x)
+        text.append(f"[{r['score']}] {r['title']}\n  {where_txt}\n"
                     f"  {r['reason'] or ''}\n" + (f"  {cv_hint(r)}\n" if cv_hint(r) else "") + f"  {r['url']}\n")
-        cards.append(f"""
-<tr><td style="padding:14px 16px;border-bottom:1px solid #e5e7eb">
-  <table role="presentation" width="100%" cellspacing="0" cellpadding="0"><tr>
-    <td width="52" valign="top"><div style="width:44px;height:44px;line-height:44px;text-align:center;
-      border-radius:22px;background:{_score_color(r['score'])};color:#fff;font-weight:700;font-size:16px">{r['score']}</div></td>
-    <td valign="top" style="padding-left:12px">
-      <a href="{esc(r['url'], quote=True)}" style="color:#0969da;font-size:16px;font-weight:600;text-decoration:none">{esc(r['title'])}</a>
-      <div style="color:#24292f;font-size:14px;margin-top:3px">{esc(r['company'])}</div>
-      <div style="color:#57606a;font-size:13px;margin-top:2px">{esc(r['location'])} · {_dist(r)} · {esc(r['source'])}</div>
-      <div style="color:#57606a;font-size:13px;margin-top:6px;font-style:italic">{esc(r['reason'] or '')}</div>
-      {f'<div style="color:#0969da;font-size:12px;margin-top:6px">{esc(cv_hint(r))}</div>' if cv_hint(r) else ''}
-    </td></tr></table>
-</td></tr>""")
-    credit = "Sources: Bundesagentur für Arbeit, Stellenwerk, Merck, Arbeitnow, SmartRecruiters"
-    footer = (f'<a href="{esc(dash, quote=True)}" style="color:#0969da">Open dashboard</a> · {credit}' if dash
-              else credit)
+    n_more = total_new - len(rows)
+    n_low = stats.get("n_low", n_more)
+    more_txt = ""
+    if rows and n_more > 0:
+        more_txt = (f"+ {n_more} more below {MIN_SCORE} on the dashboard." if n_more == n_low
+                    else f"+ {n_more} more on the dashboard.")
+        text.append(more_txt)
+    nudge = ""
+    if not rows and stats.get("untailored"):
+        k = stats["untailored"]
+        nudge = f"Still open: {k} job{'s' if k != 1 else ''} marked interested {'have' if k != 1 else 'has'} no tailored resume yet."
+        text.append(nudge)
     if dash:
         text.append(f"Dashboard: {dash}")
-    body = f"""<!doctype html><html><body style="margin:0;background:#f6f8fa;font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
-<table role="presentation" width="100%" cellspacing="0" cellpadding="0"><tr><td align="center" style="padding:16px">
-<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:640px;background:#fff;border:1px solid #d0d7de;border-radius:8px">
-<tr><td style="padding:16px;border-bottom:1px solid #e5e7eb"><div style="font-size:18px;font-weight:700;color:#24292f">Job radar</div>
-<div style="font-size:13px;color:#57606a;margin-top:2px">{esc(subtitle)}</div></td></tr>
-{''.join(cards)}
-<tr><td style="padding:12px 16px;font-size:12px;color:#57606a">{footer}</td></tr>
+
+    # --- HTML pieces
+    def button(label: str, solid: bool) -> str:
+        if not dash:
+            return ""
+        style = ("border-radius:8px;background:#0969da" if solid else "border-radius:8px;border:1px solid #0969da")
+        link = ("display:inline-block;padding:12px 20px;font-size:15px;font-weight:600;color:#ffffff;text-decoration:none" if solid
+                else "display:inline-block;padding:11px 18px;font-size:15px;font-weight:600;color:#0969da;text-decoration:none")
+        return (f'<tr><td style="padding:16px 24px 8px"><table role="presentation" cellpadding="0" cellspacing="0" border="0">'
+                f'<tr><td style="{style}"><a href="{esc(dash, quote=True)}" style="{link}">{label}</a></td></tr></table></td></tr>')
+
+    banner = ""
+    if failed:
+        if len(failed) == 1:
+            msg = (f"<strong>⚠ {esc(_src(failed[0]))} couldn't be fetched</strong> ({esc(errors.get(failed[0], 'error'))}). "
+                   "Today's list may be missing jobs from it; the radar will retry tomorrow.")
+        else:
+            msg = (f"<strong>⚠ {len(failed)} sources couldn't be fetched:</strong> "
+                   + ", ".join(f"{esc(_src(n))} ({esc(errors.get(n, 'error'))})" for n in failed)
+                   + ". Today's list may be missing jobs from them; the radar will retry tomorrow.")
+        banner = ('<tr><td style="padding:0"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" '
+                  'style="border-collapse:collapse;background:#fff8c5;border-bottom:1px solid #d4a72c"><tr>'
+                  f'<td style="padding:12px 24px;font-size:14px;line-height:1.45;color:#3b2300">{msg}</td></tr></table></td></tr>')
+
+    cards = []
+    for r in rows:
+        hint = []
+        gaps = []
+        try:
+            gaps = json.loads(r["gaps"] or "[]")
+        except ValueError:
+            pass
+        if r["cv_track"] or gaps:
+            hint.append(f"CV: {esc(r['cv_track'])}" if r["cv_track"] else "")
+            if gaps:
+                hint.append('Missing: <span style="color:#953800;font-weight:600">' + esc(", ".join(gaps)) + "</span>")
+        hint_html = (f'<div style="font-size:13px;color:#59636e;margin-top:6px">{" · ".join(x for x in hint if x)}</div>'
+                     if any(hint) else "")
+        where = " · ".join(x for x in (esc(r["location"] or ""), _dist(r) if r["distance_km"] is not None else "", esc(r["source"] or "")) if x)
+        cards.append(f"""<tr><td style="padding:8px 24px">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse;border:1px solid #d1d9e0;border-radius:8px"><tr>
+<td width="64" valign="top" style="padding:16px 0 16px 16px"><table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr><td width="44" height="44" align="center" valign="middle" style="width:44px;height:44px;border-radius:22px;background:{_score_color(r['score'])};color:#ffffff;font-size:17px;font-weight:700">{'–' if r['score'] is None else r['score']}</td></tr></table></td>
+<td valign="top" style="padding:16px 16px 16px 4px">
+<a href="{esc(r['url'], quote=True)}" style="font-size:16px;font-weight:600;line-height:1.35;color:#0969da;text-decoration:none;word-break:break-word">{esc(r['title'])}</a>
+<div style="font-size:14px;color:#1f2328;margin-top:2px">{esc(r['company'])}</div>
+<div style="font-size:13px;color:#59636e;margin-top:2px">{where}</div>
+<div style="font-size:14px;line-height:1.45;margin-top:8px">{esc(r['reason'] or '')}</div>
+{hint_html}</td></tr></table></td></tr>""")
+
+    head = (f'<tr><td style="padding:{"20px" if failed else "24px"} 24px 8px"><div style="font-size:13px;color:#59636e">Job Radar · {day}</div>'
+            f'<div style="font-size:22px;font-weight:700;line-height:1.3;margin-top:4px">{esc(headline)}</div>'
+            + (f'<div style="font-size:14px;color:#59636e;margin-top:4px">{esc(sub)}</div>' if sub else "")
+            + (f'<div style="font-size:15px;line-height:1.5;margin-top:8px">{esc(intro)}</div>' if intro else "") + "</td></tr>")
+
+    middle = ""
+    if rows:
+        middle = "".join(cards) + (f'<tr><td style="padding:8px 24px;font-size:14px;color:#59636e">{esc(more_txt)}</td></tr>' if more_txt else "")
+        cta = button("Open dashboard to triage", True)
+    else:
+        def cell(n, label, first=False):
+            border = "" if first else "border-left:1px solid #d1d9e0;"
+            return (f'<td align="center" style="padding:14px 8px;{border}"><div style="font-size:22px;font-weight:700">{n}</div>'
+                    f'<div style="font-size:13px;color:#59636e">{label}</div></td>')
+        middle = ('<tr><td style="padding:12px 24px"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" '
+                  'style="border-collapse:collapse;background:#f6f8fa;border:1px solid #d1d9e0;border-radius:8px"><tr>'
+                  + cell(tracked, "jobs tracked", True) + cell(interested, "interested") + cell(applied, "applied")
+                  + "</tr></table></td></tr>")
+        if nudge:
+            middle += f'<tr><td style="padding:8px 24px;font-size:15px;line-height:1.5"><strong>Still open:</strong> {esc(nudge[len("Still open: "):])}</td></tr>'
+        cta = button("Open dashboard", False)
+
+    src_line = ", ".join(esc(_src(n)) + (" (failed today)" if n in failed else "") for n in SOURCE_NAMES)
+    foot = ("Scores are an LLM's estimate against your CV; verify before applying.<br>" if rows else "") + f"Sources: {src_line}."
+    foot += ("<br>Dashboard is reachable over Tailscale only." if rows and dash else
+             "" if rows else '<br>You get this heartbeat so silence never means "broken".')
+    body = f"""<!doctype html><html><body style="margin:0;background:#eef1f4;font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0"><tr><td align="center" style="padding:16px 8px">
+<table role="presentation" width="640" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:640px;border-collapse:collapse;background:#ffffff;color:#1f2328">
+{banner}{head}{middle}{cta}
+<tr><td style="padding:16px 24px 24px;border-top:1px solid #d1d9e0;font-size:12px;line-height:1.5;color:#59636e">{foot}</td></tr>
 </table></td></tr></table></body></html>"""
     return subject, "\n".join(text), body
 
@@ -687,16 +781,22 @@ def main() -> int:
         save_scores(db, scores)
         log(f"rescored {len(scores)}/{len(rows)} jobs")
         return 0
-    fetched, failed = [], []
+    fetched, failed, counts, errors = [], [], {}, {}
     sources = (("BA", fetch_ba), ("Stellenwerk", fetch_stellenwerk), ("Merck", fetch_merck),
                ("Arbeitnow", fetch_arbeitnow), ("SmartRecruiters", fetch_smartrecruiters))
     for name, fn in sources:
         try:
-            fetched += fn()
+            got = fn()
+            counts[name] = len(got)
+            fetched += got
         except Exception as e:  # one broken source must not kill the others
             failed.append(name)
+            errors[name] = f"HTTP {e.code}" if isinstance(e, urllib.error.HTTPError) else type(e).__name__
             log(f"{name} failed: {e!r}")
     store_new(db, fetched)
+    if not args.dry_run:  # the dashboard shows the last real run ("5 sources OK", per-source counts)
+        db.execute("INSERT INTO runs (counts, failed) VALUES (?, ?)", (json.dumps(counts), json.dumps(failed)))
+        db.commit()
 
     pending = db.execute("SELECT * FROM jobs WHERE notified = 0 ORDER BY first_seen DESC").fetchall()
     log(f"{len(pending)} unnotified jobs")
@@ -709,11 +809,15 @@ def main() -> int:
         ranked = [r for r in pending if r["score"] is not None]
     top = [r for r in ranked if r["score"] >= MIN_SCORE][:TOP_N]
 
-    counts = dict(db.execute("SELECT status, COUNT(*) FROM jobs GROUP BY status").fetchall())
-    summary = (f"{sum(counts.values())} jobs tracked · {counts.get('interested', 0)} interested · "
-               f"{counts.get('applied', 0)} applied")
+    by_status = dict(db.execute("SELECT status, COUNT(*) FROM jobs GROUP BY status").fetchall())
+    stats = {"tracked": sum(by_status.values()), "interested": by_status.get("interested", 0),
+             "applied": by_status.get("applied", 0), "sources": len(sources),
+             "n_low": sum(1 for r in ranked if r["score"] < MIN_SCORE),
+             "untailored": db.execute(
+                 "SELECT COUNT(*) FROM jobs j WHERE j.status = 'interested' AND NOT EXISTS "
+                 "(SELECT 1 FROM tailor_jobs t WHERE t.job_id = j.id AND t.state = 'done')").fetchone()[0]}
     # Always send, even with no new jobs: the daily email doubles as a heartbeat.
-    subject, text, body = build_email(top, len(ranked), failed, summary)
+    subject, text, body = build_email(top, len(ranked), failed, errors, stats)
     if args.dry_run:
         print(f"Subject: {subject}\n\n{text}")
         if args.preview_html:

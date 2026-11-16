@@ -14,7 +14,11 @@ Runs on the home server `my-server` (Ubuntu, 24/7). Private repo: `git@github.co
   `sources.json`), CS filter, SQLite store + dedupe, ranking, HTML email. Daily entry point.
 - `cv.py` - `build` (distill CV -> `cv/profile.md`), `tailor`, `resume` (tailored one-page LaTeX), `skills`.
 - `worker.py` - polls the `tailor_jobs` queue and runs `cv.run_request` (the dashboard cannot run `claude`).
-- `dashboard.py` - FastAPI, f-string HTML, one inline script, no build step. Filters, status buttons, tailor UI.
+- `dashboard.py` - FastAPI, f-string HTML, one nonce'd inline script, no build step. Implements the redesign in
+  `docs/design-handoff.md`: client-side filters (chips, min score, source, status, search, sort; URL params are
+  the no-JS fallback), optimistic status buttons with Skip/Undo, keyboard (j/k/1-4/o/t/u), tailor slot swapped
+  in place via `/api/tailor/fragment` polling, `/gaps` weekly skill-gap report, desktop sidebar, empty states.
+  Routes: `/`, `/gaps`, `/api/status`, `/api/tailor`, `/api/tailor/status`, `/api/tailor/fragment`, `/files/<token>.pdf|tex`.
 - `job-radar.timer|service`, `job-radar-dashboard.service`, `job-radar-worker.service` - systemd **user** units,
   symlinked with `systemctl --user link`. After editing: `systemctl --user daemon-reload` and restart.
 - `DESIGN.md` - brief for UI/design work.
@@ -59,12 +63,19 @@ ask the owner which one to use. (An earlier version hard-coded the address in th
 ## Data model (`jobs.db`)
 `jobs` (id `source:ref`, score, reason, cv_track swe|devops|ml, gaps JSON, status new|interested|applied|
 not_relevant, notified, distance_km...), `tailoring` (markdown analysis per job), `tailor_jobs` (queue:
-queued|running|done|failed, pdf flag, warnings JSON). Ranking prompts include the user's past status decisions.
+queued|running|done|failed, pdf flag, warnings JSON), `runs` (one row per real daily run: per-source counts and
+failed sources, shown in the dashboard header/sidebar; dry runs do not write it). Ranking prompts include the
+user's past status decisions. Email shows at most `TOP_N` cards scoring >= `MIN_SCORE` (50), rest as "+N more".
 
 ## Known limitations / open items
 - No LaTeX engine on the server, so tailored resumes are `.tex` only. `cv.py` uses `tectonic` if it is on PATH
   or at `~/.local/bin/tectonic` (the user's laptop has it); the `.tex` reuses the master preamble.
 - Fact check of generated resumes is a heuristic (flags numbers/tool names absent from the master CV).
+- The server has no Node or browser, so the dashboard's client-side JS has only had static checks (bracket balance,
+  DOM hooks present, server HTML verified with curl). Verify interactions on a real phone/laptop after changes.
+- Auto-mode blocks downloading binaries and `pip install` of new packages here; ask the owner instead of retrying.
+- Other sessions/tools edit this repo too (`q`/`sort` search, `status_at`, `--rescore`, `feedback_block` were not
+  written by the assistant): read the current file before rewriting it and preserve features.
 - Next ideas: weekly skill-gap section in the email, dashboard password, more employer career-page sources.
 
 Commits end with: `Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>` (plus the session trailer if given).
