@@ -5,6 +5,7 @@ Sources: Bundesagentur fuer Arbeit Jobsuche API (v6) and the Stellenwerk Darmsta
 Standard library only, so the systemd unit needs no virtualenv.
 """
 import argparse
+import hashlib
 import html
 import json
 import math
@@ -424,6 +425,10 @@ def open_db() -> sqlite3.Connection:
         db.execute("ALTER TABLE jobs ADD COLUMN gaps TEXT")  # JSON list: skills the posting wants, CV lacks
     db.execute("""CREATE TABLE IF NOT EXISTS tailoring (
         job_id TEXT PRIMARY KEY, created TEXT DEFAULT CURRENT_TIMESTAMP, track TEXT, markdown TEXT)""")
+    # Work queue for the dashboard's "Tailor resume" button; worker.py processes it.
+    db.execute("""CREATE TABLE IF NOT EXISTS tailor_jobs (
+        job_id TEXT PRIMARY KEY, state TEXT NOT NULL, requested TEXT DEFAULT CURRENT_TIMESTAMP,
+        finished TEXT, error TEXT, pdf INTEGER NOT NULL DEFAULT 0, warnings TEXT)""")
     if "distance_km" not in cols:
         db.execute("ALTER TABLE jobs ADD COLUMN distance_km REAL")
         for r in db.execute("SELECT id, description FROM jobs WHERE source = 'BA'").fetchall():
@@ -499,6 +504,12 @@ def ask_claude(prompt: str, system: str = SYSTEM_PROMPT, timeout: int = 300) -> 
 
 
 TRACKS = ("swe", "devops", "ml")
+TAILORED_DIR = CV_DIR / "tailored"  # generated resumes (git-ignored with cv/)
+
+
+def file_token(job_id: str) -> str:
+    """Filename-safe, unguessable-enough id for a job's generated files (no user input in paths)."""
+    return hashlib.sha256(job_id.encode()).hexdigest()[:16]
 
 
 def rank(jobs: list[sqlite3.Row], feedback: str = "") -> dict[str, tuple[int, str, str | None, str]]:

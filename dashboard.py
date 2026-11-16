@@ -4,6 +4,7 @@
 Binds only to a Tailscale (or loopback) address; refuses anything else.
 """
 import html
+import json
 import re
 import ipaddress
 import os
@@ -17,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # run with -I, so add 
 
 import uvicorn
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 import radar
@@ -94,6 +95,57 @@ async def set_status(body: StatusUpdate, request: Request):
     return {"ok": True}
 
 
+class TailorRequest(BaseModel):
+    id: str
+
+
+MAX_QUEUED = 5
+
+
+@app.post("/api/tailor")
+async def request_tailor(body: TailorRequest, request: Request):
+    origin = request.headers.get("origin")
+    if origin and urlsplit(origin).netloc.lower() not in allowed_hosts():
+        return JSONResponse({"error": "bad origin"}, status_code=403)
+    if not radar.CV_TEX.exists():
+        return JSONResponse({"error": "cv/cv-content.tex is not on the server"}, status_code=409)
+    with db() as con:
+        if con.execute("SELECT 1 FROM jobs WHERE id = ?", (body.id,)).fetchone() is None:
+            return JSONResponse({"error": "unknown job"}, status_code=404)
+        row = con.execute("SELECT state FROM tailor_jobs WHERE job_id = ?", (body.id,)).fetchone()
+        if row and row["state"] in ("queued", "running"):
+            return {"state": row["state"]}
+        if con.execute("SELECT COUNT(*) FROM tailor_jobs WHERE state IN ('queued','running')").fetchone()[0] >= MAX_QUEUED:
+            return JSONResponse({"error": "queue is full, try again in a few minutes"}, status_code=429)
+        con.execute(
+            "INSERT INTO tailor_jobs (job_id, state, requested) VALUES (?, 'queued', CURRENT_TIMESTAMP) "
+            "ON CONFLICT(job_id) DO UPDATE SET state = 'queued', requested = CURRENT_TIMESTAMP, "
+            "finished = NULL, error = NULL, pdf = 0, warnings = NULL", (body.id,))
+    return {"state": "queued"}
+
+
+@app.get("/api/tailor/status")
+def tailor_status(id: str):
+    with db() as con:
+        row = con.execute("SELECT state FROM tailor_jobs WHERE job_id = ?", (id,)).fetchone()
+    return {"state": row["state"] if row else None}
+
+
+FILE_NAME_RE = re.compile(r"^[0-9a-f]{16}\.(pdf|tex)$")
+
+
+@app.get("/files/{name}")
+def download(name: str):
+    # Strict whitelist: nothing user-controlled reaches the filesystem path.
+    if not FILE_NAME_RE.match(name):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    path = radar.TAILORED_DIR / name
+    if not path.is_file():
+        return JSONResponse({"error": "not found"}, status_code=404)
+    media = "application/pdf" if name.endswith(".pdf") else "text/plain; charset=utf-8"
+    return FileResponse(path, media_type=media, filename=f"resume-{name}")
+
+
 def safe_url(u: str) -> str:
     return u if urlsplit(u or "").scheme in ("http", "https") else "#"
 
@@ -110,6 +162,34 @@ def render_md(md: str) -> str:
     return '<div class="md">' + "\n".join(out) + "</div>"
 
 
+def render_tailor(r: sqlite3.Row) -> str:
+    """The 'Tailor resume' area of a card: button, progress, downloads, warnings, analysis."""
+    e = html.escape
+    state, token = r["tj_state"], radar.file_token(r["id"])
+    if state in ("queued", "running"):
+        return ('<div class="tailorbox" data-pending="1"><span class="spin" aria-hidden="true"></span> '
+                f'Preparing your resume ({"waiting in queue" if state == "queued" else "working"}), about a minute…</div>')
+    parts = []
+    if state == "done":
+        links = []
+        if r["tj_pdf"]:
+            links.append(f'<a class="btn" href="/files/{token}.pdf" download>Resume (PDF)</a>')
+        links.append(f'<a class="btn" href="/files/{token}.tex" download>LaTeX source</a>')
+        parts.append(f'<div class="actions">{"".join(links)}</div>')
+        try:
+            warnings = json.loads(r["tj_warnings"] or "[]")
+        except ValueError:
+            warnings = []
+        parts += [f'<div class="warn">⚠ {e(w)}</div>' for w in warnings]
+    elif state == "failed":
+        parts.append(f'<div class="warn">Could not prepare the resume: {e(r["tj_error"] or "unknown error")}</div>')
+    if r["tailoring_md"]:
+        parts.append(f'<details class="tailor"><summary>Fit analysis &amp; what to learn</summary>{render_md(r["tailoring_md"])}</details>')
+    label = "Tailor resume" if state is None else "Regenerate" if state == "done" else "Retry"
+    parts.append(f'<button type="button" class="tailor-btn">{label}</button>')
+    return f'<div class="tailorbox">{"".join(parts)}</div>'
+
+
 def render_card(r: sqlite3.Row) -> str:
     e = html.escape
     score = r["score"]
@@ -122,10 +202,7 @@ def render_card(r: sqlite3.Row) -> str:
     more = f"<details><summary>Details</summary><p>{e(desc[:2000])}</p></details>" if desc else ""
     hint = radar.cv_hint(r)
     cv_line = f'<div class="cv">{e(hint)}</div>' if hint else ""
-    if r["tailoring_md"]:
-        tailor = f'<details class="tailor"><summary>Tailoring</summary>{render_md(r["tailoring_md"])}</details>'
-    else:
-        tailor = f'<div class="cmd">Tailor: <code>python3 -I cv.py tailor {e(r["id"])}</code></div>'
+    tailor = render_tailor(r)
     return f"""<article class="card" data-id="{e(r['id'], quote=True)}" data-status="{e(r['status'], quote=True)}">
   <div class="score {cls}">{'–' if score is None else score}</div>
   <div class="main">
@@ -160,7 +237,15 @@ input[type=range]{padding:0;accent-color:var(--accent)}
 .meta{font-size:14px;margin-top:2px;overflow-wrap:anywhere}.sub{color:var(--muted);font-size:13px}
 .reason{font-size:13px;color:var(--muted);font-style:italic;margin-top:6px}
 .cv{font-size:12px;color:var(--accent);margin-top:6px;overflow-wrap:anywhere}
-.cmd{font-size:12px;color:var(--muted);margin-top:6px;overflow-wrap:anywhere}.cmd code{user-select:all}
+.tailorbox{margin-top:10px;display:flex;flex-direction:column;gap:8px;font-size:13px;color:var(--muted)}
+.actions{display:flex;flex-wrap:wrap;gap:8px}
+.btn,.tailor-btn{display:inline-flex;align-items:center;justify-content:center;min-height:40px;padding:0 14px;font:inherit;font-size:13px;font-weight:600;border-radius:8px;border:1px solid var(--accent);color:var(--accent);background:transparent;text-decoration:none;cursor:pointer}
+.actions .btn:first-child{background:var(--accent);color:#fff}
+.tailor-btn{align-self:flex-start}.tailor-btn:disabled{opacity:.5;cursor:default}
+.warn{font-size:12px;color:var(--mid);overflow-wrap:anywhere}
+.spin{width:14px;height:14px;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;display:inline-block;vertical-align:-2px;animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+@media(prefers-reduced-motion:reduce){.spin{animation:none}}
 .md{white-space:pre-wrap;overflow-wrap:anywhere;color:var(--fg);line-height:1.5}.md h4{margin:10px 0 2px;font-size:14px}
 details{margin-top:6px;font-size:13px;color:var(--muted)}summary{cursor:pointer;min-height:24px}details p{white-space:pre-wrap;overflow-wrap:anywhere}
 .status{display:grid;grid-template-columns:repeat(2,1fr);gap:6px;margin-top:10px}
@@ -185,6 +270,28 @@ document.addEventListener('click',async e=>{
   }catch(err){alert('Could not save status ('+err.message+')');}
   finally{b.disabled=false;}
 });
+document.addEventListener('click',async e=>{
+  const t=e.target.closest('.tailor-btn');if(!t)return;
+  const card=t.closest('.card');t.disabled=true;
+  try{
+    const r=await fetch('/api/tailor',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({id:card.dataset.id})});
+    if(!r.ok){const j=await r.json().catch(()=>({}));throw new Error(j.error||r.status);}
+    location.reload();
+  }catch(err){alert('Could not start: '+err.message);t.disabled=false;}
+});
+const pending=[...document.querySelectorAll('.tailorbox[data-pending]')];
+if(pending.length){
+  setInterval(async()=>{
+    for(const box of pending){
+      const id=box.closest('.card').dataset.id;
+      try{
+        const j=await(await fetch('/api/tailor/status?id='+encodeURIComponent(id))).json();
+        if(j.state!=='queued'&&j.state!=='running'){location.reload();return;}
+      }catch(e){}
+    }
+  },4000);
+}
 """
 
 
@@ -213,7 +320,9 @@ def index(request: Request, min_score: int = Query(0, ge=0, le=100),
         where.append("status = ?"); args.append(status)
     with db() as con:
         rows = con.execute(
-            "SELECT jobs.*, t.markdown AS tailoring_md FROM jobs LEFT JOIN tailoring t ON t.job_id = jobs.id "
+            "SELECT jobs.*, t.markdown AS tailoring_md, tj.state AS tj_state, tj.pdf AS tj_pdf, "
+            "tj.warnings AS tj_warnings, tj.error AS tj_error FROM jobs "
+            "LEFT JOIN tailoring t ON t.job_id = jobs.id LEFT JOIN tailor_jobs tj ON tj.job_id = jobs.id "
             f"WHERE {' AND '.join(where)} "
             f"ORDER BY {order}, id", args).fetchall()
         total = con.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]

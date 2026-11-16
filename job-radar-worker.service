@@ -1,0 +1,17 @@
+[Unit]
+Description=Job radar tailor worker (processes dashboard "Tailor resume" requests)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/user/job-radar
+Environment=PATH=/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 -I /home/user/job-radar/worker.py
+Restart=always
+RestartSec=5
+Nice=10
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target

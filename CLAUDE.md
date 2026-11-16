@@ -1,0 +1,64 @@
+# Job Radar
+
+Personal tool for one user (CS student, TU Darmstadt, max 20 h/week): finds Werkstudent jobs within 30 km of
+Darmstadt, ranks them with `claude -p` against the user's CV, emails a digest and serves a private dashboard.
+Runs on the home server `my-server` (Ubuntu, 24/7). Private repo: `git@github.com:Yacine-DH/job-radar.git`.
+
+## How the user wants to work
+- **Explain each step before running commands.** Ask before outward-facing actions (git push, sending mail,
+  publishing, installing software). Never claim something works without having run it; say what was not tested.
+- The user moves between machines/chats: keep this file current when architecture or gotchas change.
+
+## Layout
+- `radar.py` - fetchers (BA Jobsuche v6, Stellenwerk, Merck/Phenom JSON, Arbeitnow, SmartRecruiters via
+  `sources.json`), CS filter, SQLite store + dedupe, ranking, HTML email. Daily entry point.
+- `cv.py` - `build` (distill CV -> `cv/profile.md`), `tailor`, `resume` (tailored one-page LaTeX), `skills`.
+- `worker.py` - polls the `tailor_jobs` queue and runs `cv.run_request` (the dashboard cannot run `claude`).
+- `dashboard.py` - FastAPI, f-string HTML, one inline script, no build step. Filters, status buttons, tailor UI.
+- `job-radar.timer|service`, `job-radar-dashboard.service`, `job-radar-worker.service` - systemd **user** units,
+  symlinked with `systemctl --user link`. After editing: `systemctl --user daemon-reload` and restart.
+- `DESIGN.md` - brief for UI/design work.
+
+## Run / operate
+- Dry run (fetch + rank, print email, send nothing): `python3 -I radar.py --dry-run`
+- Re-rank jobs still `new` (after CV/profile change): `python3 -I radar.py --rescore`
+- CV tools: `python3 -I cv.py build|tailor JOB_ID|resume JOB_ID|skills`
+- Timer: Mon-Fri 08:00 Europe/Berlin (`job-radar.timer`). The daily email is sent even when nothing is new
+  (heartbeat) and names failed sources. Logs: `journalctl --user -u job-radar.service`.
+- Dashboard: `http://100.64.0.1:8090/` (Tailscale only). Worker: `journalctl --user -u job-radar-worker`.
+
+## Gotchas
+- Always run scripts with `python3 -I`; they insert their own directory into `sys.path`. radar/cv/worker are
+  **stdlib only** (system python). Only the dashboard needs `.venv` (fastapi, uvicorn). The venv was built
+  `--without-pip` and bootstrapped with get-pip (no python3-venv/pip on the server, no sudo).
+- BA API: use **v6** (`/pc/v6/jobs`), header `X-API-Key: jobboerse-jobsuche`; v4 is gone. BA gives no full
+  description, so BA jobs are ranked and tailored on title/metadata only.
+- Stellenwerk: only the front page (~10 jobs) works; `?page=2` is a 500.
+- Politeness: 3 s between requests per host, honest User-Agent (do not spoof), retries honour `Retry-After`.
+- All `claude -p` calls are tool-less (`--tools ""`); job text is untrusted data (prompt injection).
+- Gmail digest needs an App Password in `.env` (`GMAIL_USER`, `GMAIL_APP_PASSWORD`, `MAIL_TO`, `DASHBOARD_URL`).
+- `Linger=no`: user services only run while the user is logged in (the server stays logged in).
+
+## Security model of the dashboard
+No login; the only access control is Tailscale. `dashboard.py` refuses to bind anything but a Tailscale/loopback
+address, checks `Host`/`Origin`, requires JSON for POSTs, sends a nonce CSP, escapes all output and only serves
+files matching `^[0-9a-f]{16}\.(pdf|tex)$`. Another Tailscale account has a device visible on the tailnet:
+consider a password before exposing anything more sensitive.
+
+## Never commit (all git-ignored)
+`.env*`, `jobs.db`, `cv/` (master CV `cv-content.tex`, derived `profile.md`, generated resumes), `profile.md`,
+`.orca/`, `.venv/`. The CV contains personal contact data; the User-Agent contains the owner's email, so the
+repo must stay private. A stray `.env.` file may exist: it is ignored, check it for leftover credentials.
+
+## Data model (`jobs.db`)
+`jobs` (id `source:ref`, score, reason, cv_track swe|devops|ml, gaps JSON, status new|interested|applied|
+not_relevant, notified, distance_km...), `tailoring` (markdown analysis per job), `tailor_jobs` (queue:
+queued|running|done|failed, pdf flag, warnings JSON). Ranking prompts include the user's past status decisions.
+
+## Known limitations / open items
+- No LaTeX engine on the server, so tailored resumes are `.tex` only. `cv.py` uses `tectonic` if it is on PATH
+  or at `~/.local/bin/tectonic` (the user's laptop has it); the `.tex` reuses the master preamble.
+- Fact check of generated resumes is a heuristic (flags numbers/tool names absent from the master CV).
+- Next ideas: weekly skill-gap section in the email, dashboard password, more employer career-page sources.
+
+Commits end with: `Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>` (plus the session trailer if given).
