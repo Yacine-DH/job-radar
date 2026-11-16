@@ -68,12 +68,14 @@ failed sources, shown in the dashboard header/sidebar; dry runs do not write it)
 user's past status decisions. Email shows at most `TOP_N` cards scoring >= `MIN_SCORE` (50), rest as "+N more".
 
 ## Known limitations / open items
-- No LaTeX engine on the server, so tailored resumes are `.tex` only. `cv.py` uses `tectonic` if it is on PATH
-  or at `~/.local/bin/tectonic` (the user's laptop has it); the `.tex` reuses the master preamble.
+- PDFs: `tectonic` 0.17.0 (XeTeX) is installed at `~/.local/bin/tectonic` (official GitHub release, SHA-256 matched
+  the published digest). The master CV uses `fontspec`, so `pdflatex` cannot compile it. First compile fetches TeX
+  support files (~2 min), later ones are cached. If tectonic is missing, resumes fall back to `.tex` only.
 - Fact check of generated resumes is a heuristic (flags numbers/tool names absent from the master CV).
 - The server has no Node or browser, so the dashboard's client-side JS has only had static checks (bracket balance,
   DOM hooks present, server HTML verified with curl). Verify interactions on a real phone/laptop after changes.
-- Auto-mode blocks downloading binaries and `pip install` of new packages here; ask the owner instead of retrying.
+- Auto-mode blocks unrequested downloads and `pip install` here (the tectonic download only went through after the
+  owner explicitly asked for it); ask the owner first instead of retrying.
 - Other sessions/tools edit this repo too (`q`/`sort` search, `status_at`, `--rescore`, `feedback_block` were not
   written by the assistant): read the current file before rewriting it and preserve features.
 - Next ideas: weekly skill-gap section in the email, dashboard password, more employer career-page sources.
