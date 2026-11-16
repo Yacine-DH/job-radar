@@ -28,7 +28,7 @@ HERE = Path(__file__).resolve().parent
 DB_PATH = HERE / "jobs.db"
 ENV_PATH = HERE / ".env"
 
-USER_AGENT = "job-radar/0.1 (personal job search tool; contact: owner@example.invalid)"
+USER_AGENT = "job-radar/0.1 (personal job search tool)"  # generic on purpose; see user_agent()
 MIN_DELAY = 3.0  # seconds between requests to the same host
 MAX_RETRIES = 3
 
@@ -121,9 +121,16 @@ def is_student_cs(title: str, extra: str = "", description: str = "") -> bool:
 _last_request: dict[str, float] = {}
 
 
+def user_agent() -> str:
+    """Honest, generic User-Agent. A contact (email or URL) is added only if the owner sets
+    JOB_RADAR_CONTACT in .env themselves: personal data never goes into request headers by default."""
+    contact = os.environ.get("JOB_RADAR_CONTACT", "").strip()
+    return f"{USER_AGENT[:-1]}; contact: {contact})" if contact else USER_AGENT
+
+
 def http_get(url: str, headers: dict | None = None, accept_json: bool = False) -> str:
     host = urllib.parse.urlsplit(url).netloc
-    hdrs = {"User-Agent": USER_AGENT, "Accept": "application/json" if accept_json else "text/html"}
+    hdrs = {"User-Agent": user_agent(), "Accept": "application/json" if accept_json else "text/html"}
     hdrs.update(headers or {})
     for attempt in range(1, MAX_RETRIES + 1):
         wait = MIN_DELAY - (time.monotonic() - _last_request.get(host, 0.0))

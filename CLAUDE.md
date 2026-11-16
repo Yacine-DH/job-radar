@@ -47,8 +47,14 @@ consider a password before exposing anything more sensitive.
 
 ## Never commit (all git-ignored)
 `.env*`, `jobs.db`, `cv/` (master CV `cv-content.tex`, derived `profile.md`, generated resumes), `profile.md`,
-`.orca/`, `.venv/`. The CV contains personal contact data; the User-Agent contains the owner's email, so the
-repo must stay private. A stray `.env.` file may exist: it is ignored, check it for leftover credentials.
+`.orca/`, `.venv/`. The CV contains personal contact data, so the repo must stay private. A stray `.env.`
+file may exist: it is ignored, check it for leftover credentials.
+
+## Privacy rule: the owner's email address
+Never put the owner's email address (or phone, name) in request headers, URLs or payloads sent to external
+sites, and never hard-code it in a script. The User-Agent is generic (`user_agent()` in `radar.py`); a contact
+is appended only if the owner sets `JOB_RADAR_CONTACT` in `.env` themselves. If a site needs a real contact,
+ask the owner which one to use. (An earlier version hard-coded the address in the User-Agent; that is fixed.)
 
 ## Data model (`jobs.db`)
 `jobs` (id `source:ref`, score, reason, cv_track swe|devops|ml, gaps JSON, status new|interested|applied|
