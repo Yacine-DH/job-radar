@@ -19,9 +19,13 @@ Runs on the home server `my-server` (Ubuntu, 24/7). Private repo: `git@github.co
   the no-JS fallback), optimistic status buttons with Skip/Undo, keyboard (j/k/1-4/o/t/u), tailor slot swapped
   in place via `/api/tailor/fragment` polling, `/gaps` weekly skill-gap report, desktop sidebar, empty states.
   Routes: `/`, `/gaps`, `/api/status`, `/api/tailor`, `/api/tailor/status`, `/api/tailor/fragment`, `/files/<token>.pdf|tex`.
-- `job-radar.timer|service`, `job-radar-dashboard.service`, `job-radar-worker.service` - systemd **user** units,
-  symlinked with `systemctl --user link`. After editing: `systemctl --user daemon-reload` and restart.
-- `DESIGN.md` - brief for UI/design work.
+- `systemd/` - the units (`job-radar.timer|service`, `job-radar-dashboard.service`, `job-radar-worker.service`) and
+  `install.sh`, which links and enables them (idempotent). They are symlinked into `~/.config/systemd/user`, so
+  moving a unit file breaks the links: re-run `systemd/install.sh`. After editing a unit: `daemon-reload` + restart.
+- `tests/` - stdlib `unittest`, fake data only, never touches the real DB/CV/network:
+  `.venv/bin/python -m unittest discover -s tests -t .` (run it after changing logic; add tests for new logic).
+- `docs/design-brief.md` (brief for UI work) and `docs/design-handoff.md` (the redesign the dashboard follows).
+- `README.md` is for humans; this file is for Claude. `requirements.txt` lists the dashboard's dependencies.
 
 ## Run / operate
 - Dry run (fetch + rank, print email, send nothing): `python3 -I radar.py --dry-run`
