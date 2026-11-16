@@ -4,6 +4,7 @@
   cv.py build [--force]        distill cv/cv-content.tex into cv/profile.md (used by the ranking)
   cv.py tailor JOB_ID          gap analysis + tailored CV advice for one job, saved to the DB
   cv.py resume JOB_ID          analysis + a tailored one-page resume (.tex, and .pdf if a LaTeX engine exists)
+  cv.py recompile [JOB_ID]     build missing PDFs from the .tex already on disk (no LLM calls)
   cv.py skills [--min-score N] most frequent skills the top jobs ask for that the CV lacks
 """
 import argparse
@@ -202,6 +203,12 @@ def pdf_pages(pdf: Path) -> int | None:
         return None
 
 
+def compile_tex(exe: str, tex_path: Path) -> subprocess.CompletedProcess:
+    """Compile with tectonic (XeTeX; the master CV needs fontspec, which pdflatex cannot do)."""
+    return subprocess.run([exe, "-X", "compile", "--outdir", str(tex_path.parent), str(tex_path)],
+                          capture_output=True, text=True, timeout=300, cwd=tex_path.parent)
+
+
 def _gen_body(job: sqlite3.Row, analysis: str, master: str, extra: str = "") -> tuple[str, str, str]:
     pre, master_body = split_master(master)
     prompt = (
@@ -257,8 +264,7 @@ def resume_job(db: sqlite3.Connection, job: sqlite3.Row, analysis: str) -> dict:
         if not exe:
             warnings.append("No LaTeX engine (tectonic) installed on the server: only the .tex was produced.")
             break
-        proc = subprocess.run([exe, "-X", "compile", "--outdir", str(radar.TAILORED_DIR), str(tex_path)],
-                              capture_output=True, text=True, timeout=300, cwd=radar.TAILORED_DIR)
+        proc = compile_tex(exe, tex_path)
         if proc.returncode != 0 or not pdf_path.exists():
             if attempt == 2:
                 raise RuntimeError("LaTeX compile failed: " + (proc.stderr or proc.stdout)[-300:].strip())
@@ -300,6 +306,44 @@ def resume(ref: str) -> int:
     return 0
 
 
+def recompile(ref: str | None) -> int:
+    """Build PDFs for resumes that were generated without one (e.g. before tectonic was installed).
+    No LLM calls: it compiles the .tex already on disk and fixes the stored state."""
+    exe = find_tectonic()
+    if not exe:
+        sys.exit("tectonic not found (PATH or ~/.local/bin/tectonic)")
+    db = radar.open_db()
+    if ref:
+        job_ids = [_find_job(db, ref)["id"]]
+    else:
+        job_ids = [r["job_id"] for r in db.execute("SELECT job_id FROM tailor_jobs WHERE state = 'done' AND pdf = 0")]
+    if not job_ids:
+        print("nothing to do: every finished resume already has a PDF")
+    for jid in job_ids:
+        tex = radar.TAILORED_DIR / f"{radar.file_token(jid)}.tex"
+        if not tex.exists():
+            print(f"{jid}: no .tex on disk, use Regenerate in the dashboard")
+            continue
+        proc = compile_tex(exe, tex)
+        pdf = tex.with_suffix(".pdf")
+        if proc.returncode != 0 or not pdf.exists():
+            print(f"{jid}: compile failed: {(proc.stderr or proc.stdout)[-200:].strip()}")
+            continue
+        pages = pdf_pages(pdf)
+        row = db.execute("SELECT warnings FROM tailor_jobs WHERE job_id = ?", (jid,)).fetchone()
+        try:
+            warnings = [w for w in json.loads(row["warnings"] or "[]") if not w.startswith("No LaTeX engine")]
+        except ValueError:
+            warnings = []
+        if pages and pages > 1:
+            warnings.append(f"The PDF is {pages} pages; trim it by hand.")
+        db.execute("UPDATE tailor_jobs SET pdf = 1, warnings = ? WHERE job_id = ?",
+                   (json.dumps(warnings, ensure_ascii=False), jid))
+        db.commit()
+        print(f"{jid}: PDF built ({pages} page{'s' if pages != 1 else ''}){' with warnings' if warnings else ''}")
+    return 0
+
+
 def skills(min_score: int) -> int:
     db = radar.open_db()
     rows = db.execute("SELECT title, company, score, gaps FROM jobs WHERE score >= ? AND gaps IS NOT NULL "
@@ -326,11 +370,13 @@ def main() -> int:
     b = sub.add_parser("build"); b.add_argument("--force", action="store_true")
     t = sub.add_parser("tailor"); t.add_argument("job_id")
     r = sub.add_parser("resume"); r.add_argument("job_id")
+    c = sub.add_parser("recompile"); c.add_argument("job_id", nargs="?")
     s = sub.add_parser("skills"); s.add_argument("--min-score", type=int, default=50)
     a = ap.parse_args()
     radar.load_env()
     return {"build": lambda: build(a.force), "tailor": lambda: tailor(a.job_id),
-            "resume": lambda: resume(a.job_id), "skills": lambda: skills(a.min_score)}[a.cmd]()
+            "resume": lambda: resume(a.job_id), "recompile": lambda: recompile(a.job_id),
+            "skills": lambda: skills(a.min_score)}[a.cmd]()
 
 
 if __name__ == "__main__":
