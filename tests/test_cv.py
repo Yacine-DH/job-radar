@@ -62,6 +62,32 @@ class ValidatorTests(unittest.TestCase):
         self.assertEqual(cv.validate_body("tiny", MASTER), "body too short")
 
 
+class OwnerInstructionsTests(unittest.TestCase):
+    def prompt_for(self, notes=""):
+        captured = {}
+
+        def fake_ask(prompt, system=None, timeout=0):
+            captured["p"] = prompt
+            return "% role=devops lang=de\n" + PADDING
+
+        job = {"title": "Werkstudent DevOps", "company": "Beispiel GmbH", "location": "Frankfurt", "distance_km": 5,
+               "source": "BA", "description": "x" * 400, "cv_track": "devops"}
+        with mock.patch.object(radar, "ask_claude", side_effect=fake_ask):
+            cv._gen_body(job, "analysis", "\\begin{document}body\\end{document}", "", notes)
+        return captured["p"]
+
+    def test_owner_instructions_reach_the_prompt_with_the_no_invention_guard(self):
+        p = self.prompt_for("Group the hackathon series as one block and keep all four results.")
+        self.assertIn("OWNER INSTRUCTIONS", p)
+        self.assertIn("Group the hackathon series as one block", p)
+        self.assertIn("never invent facts or links", p)
+        self.assertLess(p.index("OWNER INSTRUCTIONS"), p.index("JOB POSTING:"))
+
+    def test_no_instructions_block_when_there_are_none(self):
+        self.assertNotIn("OWNER INSTRUCTIONS", self.prompt_for(""))
+        self.assertNotIn("OWNER INSTRUCTIONS", self.prompt_for("   "))
+
+
 class FactFlaggingTests(unittest.TestCase):
     def test_flags_invented_numbers_and_tools_but_not_faithful_text(self):
         faithful = "TypeScript and Python with 0{,}958 accuracy on 47 test cases, Docker Compose."

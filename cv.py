@@ -3,7 +3,7 @@
 
   cv.py build [--force]        distill cv/cv-content.tex into cv/profile.md (used by the ranking)
   cv.py tailor JOB_ID          gap analysis + tailored CV advice for one job, saved to the DB
-  cv.py resume JOB_ID          analysis + a tailored one-page resume (.tex, and .pdf if a LaTeX engine exists)
+  cv.py resume JOB_ID [--notes TEXT | --notes-file F]   analysis + a tailored one-page resume (.tex, and .pdf if a LaTeX engine exists)
   cv.py recompile [JOB_ID]     build missing PDFs from the .tex already on disk (no LLM calls)
   cv.py skills [--min-score N] most frequent skills the top jobs ask for that the CV lacks
 """
@@ -285,8 +285,10 @@ def ensure_baseline(db: sqlite3.Connection, job_id: str) -> None:
     snapshot_version(db, job_id, warnings=warnings, created=created)
 
 
-def _gen_body(job: sqlite3.Row, analysis: str, master: str, extra: str = "") -> tuple[str, str, str]:
+def _gen_body(job: sqlite3.Row, analysis: str, master: str, extra: str = "", notes: str = "") -> tuple[str, str, str]:
     pre, master_body = split_master(master)
+    owner = (f"OWNER INSTRUCTIONS (from the CV's owner for this one resume; follow them unless they conflict with the rules above, "
+             f"above all: never invent facts or links):\n{notes.strip()}\n\n") if notes.strip() else ""
     prompt = (
         "Adapt the resume below to ONE job. Output ONLY the LaTeX body that goes between \\begin{document} and "
         "\\end{document}: no preamble, no code fences, no commentary.\n"
@@ -304,7 +306,7 @@ def _gen_body(job: sqlite3.Row, analysis: str, master: str, extra: str = "") -> 
         "- Facts, numbers, tools and links must come from the master. Never mention anything the CV lacks, even if "
         "the posting asks for it.\n"
         "- It must fit ONE A4 page at the master's 10pt layout: be selective (about 3 projects, 2 bullets each).\n\n"
-        f"{extra}JOB POSTING:\n{_job_block(job)}\nANALYSIS OF THE FIT (use its CV-tailoring advice):\n{analysis}\n\n"
+        f"{extra}{owner}JOB POSTING:\n{_job_block(job)}\nANALYSIS OF THE FIT (use its CV-tailoring advice):\n{analysis}\n\n"
         f"MASTER CV BODY (LaTeX, both languages in \\T, role variants via \\if..):\n{master_body}")
     text = radar.ask_claude(prompt, RESUME_SYSTEM, timeout=600).strip()
     fence = re.search(r"```(?:latex|tex)?\n(.*?)```", text, re.S)
@@ -315,7 +317,7 @@ def _gen_body(job: sqlite3.Row, analysis: str, master: str, extra: str = "") -> 
     return body, role, lang
 
 
-def resume_job(db: sqlite3.Connection, job: sqlite3.Row, analysis: str) -> dict:
+def resume_job(db: sqlite3.Connection, job: sqlite3.Row, analysis: str, notes: str = "") -> dict:
     """Generate a tailored resume for `job`. Returns {pdf, warnings, role, lang}; raises on unusable output."""
     master = radar.CV_TEX.read_text()
     pre, _ = split_master(master)
@@ -328,7 +330,7 @@ def resume_job(db: sqlite3.Connection, job: sqlite3.Row, analysis: str) -> dict:
     warnings: list[str] = []
     extra, body, role, lang = "", "", "swe", "en"
     for attempt in range(3):
-        body, role, lang = _gen_body(job, analysis, master, extra)
+        body, role, lang = _gen_body(job, analysis, master, extra, notes)
         err = validate_body(body, master)
         if err:
             if attempt == 2:
@@ -360,11 +362,13 @@ def resume_job(db: sqlite3.Connection, job: sqlite3.Row, analysis: str) -> dict:
     odd = unverified(body, master)
     if odd:
         warnings.append("Not found in your master CV, please verify: " + ", ".join(odd[:15]))
+    if pdf_path.exists():
+        pdf_path.chmod(0o600)  # tectonic writes it group/world-readable
     version = snapshot_version(db, job["id"], role, lang, warnings)
     return {"pdf": pdf_path.exists(), "warnings": warnings, "role": role, "lang": lang, "version": version}
 
 
-def run_request(db: sqlite3.Connection, job_id: str) -> dict:
+def run_request(db: sqlite3.Connection, job_id: str, notes: str = "") -> dict:
     """What the worker does for one queued dashboard request: analysis, then resume."""
     job = db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
     if job is None:
@@ -372,13 +376,13 @@ def run_request(db: sqlite3.Connection, job_id: str) -> dict:
     if not radar.CV_TEX.exists():
         raise RuntimeError("cv/cv-content.tex is missing")
     analysis = tailor_job(db, job)
-    return resume_job(db, job, analysis)
+    return resume_job(db, job, analysis, notes)
 
 
-def resume(ref: str) -> int:
+def resume(ref: str, notes: str = "") -> int:
     db = radar.open_db()
     job = _find_job(db, ref)
-    res = run_request(db, job["id"])
+    res = run_request(db, job["id"], notes)
     token = radar.file_token(job["id"])
     print(f"role={res['role']} lang={res['lang']} pdf={res['pdf']}\n{radar.TAILORED_DIR / token}.tex")
     for w in res["warnings"]:
@@ -464,12 +468,14 @@ def main() -> int:
     b = sub.add_parser("build"); b.add_argument("--force", action="store_true")
     t = sub.add_parser("tailor"); t.add_argument("job_id")
     r = sub.add_parser("resume"); r.add_argument("job_id")
+    r.add_argument("--notes", default="", help="instructions for this resume (what to emphasise, what to group)")
+    r.add_argument("--notes-file", help="read the instructions from a file instead")
     c = sub.add_parser("recompile"); c.add_argument("job_id", nargs="?")
     s = sub.add_parser("skills"); s.add_argument("--min-score", type=int, default=50)
     a = ap.parse_args()
     radar.load_env()
     return {"build": lambda: build(a.force), "tailor": lambda: tailor(a.job_id),
-            "resume": lambda: resume(a.job_id), "recompile": lambda: recompile(a.job_id),
+            "resume": lambda: resume(a.job_id, Path(a.notes_file).read_text() if a.notes_file else a.notes), "recompile": lambda: recompile(a.job_id),
             "skills": lambda: skills(a.min_score)}[a.cmd]()
 
 
