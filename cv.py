@@ -192,6 +192,50 @@ def unverified(body: str, master: str) -> list[str]:
     return strong + caps
 
 
+LANG_NAMES = {"arabisch": "ar", "arabic": "ar", "deutsch": "de", "german": "de", "englisch": "en", "english": "en",
+              "französisch": "fr", "french": "fr", "spanisch": "es", "spanish": "es"}
+VERIFY_CLAIMS = True  # second model pass that compares the resume with the master (tests switch it off)
+
+
+def _language_mentions(tex: str) -> list[tuple[str, str, str, str]]:
+    """(name as written, level as written, language key, normalised level) for 'Spanisch (A2)', 'Arabic (native)', ..."""
+    out = []
+    for name, level in re.findall(r"([A-Za-zÄÖÜäöüéè]+)\s*\(([^)]*)\)", _plain_text(tex)):
+        key = LANG_NAMES.get(name.lower())
+        if key:
+            norm = "native" if re.search(r"muttersprache|native", level, re.I) else level.strip().upper()
+            out.append((name, level.strip(), key, norm))
+    return out
+
+
+def language_level_issues(body: str, master: str) -> list[str]:
+    """Language levels in the resume that differ from the master (an invented 'B2->A2' must never ship)."""
+    known: dict[str, set[str]] = {}
+    for _, _, key, level in _language_mentions(master):
+        known.setdefault(key, set()).add(level)
+    return [f"language level differs from the master: {name} ({raw}); the master says {', '.join(sorted(known[key]))}"
+            for name, raw, key, level in _language_mentions(body) if key in known and level not in known[key]]
+
+
+def verify_claims(body: str, master: str) -> list[str]:
+    """Second opinion: resume fragments that say something the master CV does not support (a fact moved to another
+    project, a changed number or level, an added qualifier). Wording changes and merging bullets of one project are fine."""
+    prompt = (
+        "Compare a generated RESUME body with the owner's MASTER CV (both LaTeX; \\T{english}{deutsch} holds both languages, "
+        "\\if.. switches select role variants). List every fragment of the RESUME that states something the MASTER does not "
+        "support: a fact moved from one project to another, a changed language level, year or number, an added qualifier "
+        "(for example 'without cloud'), a skill or activity attributed to a project it does not belong to. Translation, "
+        "shortening, reordering and merging bullets of the SAME project are fine. Output ONLY a JSON array of short strings "
+        "(quote the fragment, then say what is wrong); output [] if everything is supported.\n\n"
+        f"MASTER:\n{split_master(master)[1]}\n\nRESUME BODY:\n{body}")
+    try:
+        text = radar.ask_claude(prompt, TAILOR_SYSTEM, timeout=300)
+        arr = json.loads(text[text.index("["): text.rindex("]") + 1])
+    except (ValueError, subprocess.SubprocessError):
+        return []  # a failed check must not block the resume; the heuristic warnings still apply
+    return [str(x)[:300] for x in arr if str(x).strip()][:10]
+
+
 def find_tectonic() -> str | None:
     return shutil.which("tectonic") or next(
         (str(p) for p in (Path.home() / ".local/bin/tectonic",) if p.exists() and os.access(p, os.X_OK)), None)
@@ -337,6 +381,12 @@ def resume_job(db: sqlite3.Connection, job: sqlite3.Row, analysis: str, notes: s
                 raise RuntimeError(f"generated resume rejected: {err}")
             extra = f"Your previous answer was rejected ({err}). Fix that and follow all rules.\n\n"
             continue
+        issues = language_level_issues(body, master) or (verify_claims(body, master) if VERIFY_CLAIMS else [])
+        if issues and attempt < 2:
+            extra = ("Your previous answer contained claims the master CV does not support:\n- " + "\n- ".join(issues)
+                     + "\nFix every one of them using only facts from the master, in the right project.\n\n")
+            continue
+        warnings += [f"Possible unsupported claim: {i}" for i in issues]
         tex = (f"\\def\\cvrole{{{role}}}\\def\\cvlang{{{lang}}}\\def\\cvstyle{{classic}}\n"
                f"{pre}\\begin{{document}}\n{body}\n\\end{{document}}\n")
         tex_path.write_text(tex)

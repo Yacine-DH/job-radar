@@ -88,6 +88,36 @@ class OwnerInstructionsTests(unittest.TestCase):
         self.assertNotIn("OWNER INSTRUCTIONS", self.prompt_for("   "))
 
 
+class ClaimCheckTests(unittest.TestCase):
+    MASTER_LANGS = r"\\T{Arabic (native), German (C1), Spanish (A2)}{Arabisch (Muttersprache), Deutsch (C1), Spanisch (A2)}"
+
+    def test_a_changed_language_level_is_caught(self):
+        issues = cv.language_level_issues("Spanisch (B2→A2), Deutsch (C1)", self.MASTER_LANGS)
+        self.assertEqual(len(issues), 1)
+        self.assertIn("Spanisch", issues[0])
+        self.assertIn("A2", issues[0])
+
+    def test_faithful_levels_in_either_language_pass(self):
+        for body in ("Arabisch (Muttersprache), Deutsch (C1), Spanisch (A2)", "Arabic (native), German (C1), Spanish (A2)"):
+            self.assertEqual(cv.language_level_issues(body, self.MASTER_LANGS), [])
+
+    def test_text_without_levels_and_unknown_languages_are_ignored(self):
+        self.assertEqual(cv.language_level_issues("Docker (B2), Japanisch (N1)", self.MASTER_LANGS), [])
+
+    def test_verifier_parses_the_models_json_and_survives_noise(self):
+        reply = 'Here you go: ["Tathbeet: \'without cloud\' is not in the master", "Spanisch (B2→A2)"] thanks'
+        with mock.patch.object(radar, "ask_claude", return_value=reply):
+            self.assertEqual(len(cv.verify_claims("body", "\\begin{document}m\\end{document}")), 2)
+        with mock.patch.object(radar, "ask_claude", return_value="[]"):
+            self.assertEqual(cv.verify_claims("body", "\\begin{document}m\\end{document}"), [])
+
+    def test_a_broken_verifier_never_blocks_a_resume(self):
+        with mock.patch.object(radar, "ask_claude", return_value="no json at all"):
+            self.assertEqual(cv.verify_claims("body", "\\begin{document}m\\end{document}"), [])
+        with mock.patch.object(radar, "ask_claude", side_effect=subprocess.CalledProcessError(1, "claude")):
+            self.assertEqual(cv.verify_claims("body", "\\begin{document}m\\end{document}"), [])
+
+
 class FactFlaggingTests(unittest.TestCase):
     def test_flags_invented_numbers_and_tools_but_not_faithful_text(self):
         faithful = "TypeScript and Python with 0{,}958 accuracy on 47 test cases, Docker Compose."
