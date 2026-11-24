@@ -1,3 +1,4 @@
+import contextlib
 import json
 import os
 import stat
@@ -141,13 +142,46 @@ class ClaimCheckTests(unittest.TestCase):
         self.assertIn("BEGIN MASTER", prompt)
         self.assertIn("DATA", cv.VERIFY_SYSTEM)
 
-    def test_fragments_the_model_found_fine_are_not_findings_but_real_ones_that_mention_support_are(self):
+    def test_only_explicit_no_issue_entries_are_dropped_real_findings_about_support_survive(self):
         reply = json.dumps(["'A' is supported (no issue)", "'B' shortened, supported, no issue",
-                            "'C' is supported", "'D' claims support for a tool the master never mentions",
-                            "'E' is only partly supported by the master"])
+                            "'C' is only partly supported", "'D': only C1 is supported.", "'E': neither is supported."])
         with mock.patch.object(radar, "ask_claude", return_value=reply):
             out = cv.verify_claims("body", r"\begin{document}m\end{document}")
-        self.assertEqual([f[:3] for f in out], ["'D'", "'E'"])
+        self.assertEqual([f[:3] for f in out], ["'C'", "'D'", "'E'"])
+
+    def test_structured_findings_are_formatted_and_non_findings_are_dropped(self):
+        reply = json.dumps([
+            {"fragment": "Spanisch (B2)", "problem": "the master says C1"},
+            {"fragment": "X", "problem": "supported, no issue"}, {"fragment": "Y", "problem": "None"},
+            {"fragment": "Z", "problem": "no issue here"}, {"fragment": "", "problem": "something"}, {"problem": "orphan"},
+            {"fragment": "ProjectX: 'no cloud'", "problem": "'no cloud' belongs to another project"}])
+        with mock.patch.object(radar, "ask_claude", return_value=reply):
+            out = cv.verify_claims("body", r"\begin{document}m\end{document}")
+        self.assertEqual(out, ["Spanisch (B2): the master says C1", "ProjectX: 'no cloud': 'no cloud' belongs to another project"])
+
+    def test_the_prompt_asks_for_objects_and_forbids_listing_supported_fragments(self):
+        with mock.patch.object(radar, "ask_claude", return_value="[]") as ask:
+            cv.verify_claims("body", r"\begin{document}m\end{document}")
+        self.assertIn('"fragment"', ask.call_args.args[0])
+        self.assertIn("must not appear at all", ask.call_args.args[0])
+
+    def test_a_numeric_citation_in_the_prose_does_not_hijack_the_json_parsing(self):
+        self.assertEqual(cv._json_list('Ref [1]: ["Spanisch (B2) differs"]'), ["Spanisch (B2) differs"])
+        self.assertIsNone(cv._json_list("see [1] and [2.5]"))
+        self.assertEqual(cv._json_list('```json\n["x"]\n```'), ["x"])
+
+    def test_tex_comments_are_stripped_even_after_a_line_break_but_escaped_percents_stay(self):
+        self.assertEqual(cv._strip_tex_comments("a\\\\% hidden\nb 50\\% sure"), "a\\\\\nb 50\\% sure")
+
+    def test_colon_formats_stay_within_their_own_entry(self):
+        for body in ("Deutsch: B2\nSpanisch: C1", "Deutsch: B2 | Spanisch: C1", "Deutsch: B2 / Spanisch: C1"):
+            self.assertEqual(cv.language_level_issues(body, self.MASTER_LANGS), [], body)
+        self.assertEqual(len(cv.language_level_issues("Spanisch: b2", self.MASTER_LANGS)), 1)
+
+    def test_native_after_a_colon_is_understood(self):
+        for body in ("Französisch: Muttersprache", "French: native"):
+            self.assertEqual(cv.language_level_issues(body, self.MASTER_LANGS), [], body)
+        self.assertEqual(len(cv.language_level_issues("Spanisch: native", self.MASTER_LANGS)), 1)
 
     def test_an_unavailable_verifier_returns_none_never_a_silent_pass(self):
         for effect in ({"return_value": "no json"}, {"side_effect": subprocess.CalledProcessError(1, "claude")}):
@@ -160,6 +194,7 @@ class ResumeLoopTests(unittest.TestCase):
     LOOP_MASTER = MASTER.replace("\\end{document}", "\\T{German (B2), Spanish (C1)}{Deutsch (B2), Spanisch (C1)}\n\\end{document}")
     GOOD = "% role=devops lang=de\n" + PADDING + " Spanisch (C1)"
     BAD = "% role=devops lang=de\n" + PADDING + " Spanisch (A1)"
+    TINY = "tiny"  # fails validation ("body too short")
 
     def setUp(self):
         self._keep = fresh_db()
@@ -177,53 +212,96 @@ class ResumeLoopTests(unittest.TestCase):
         radar.TAILORED_DIR, radar.CV_TEX = self._old
         self._tmp.cleanup()
 
-    def run_job(self, bodies, verifier=None, verify=True):
-        gen = mock.Mock(side_effect=[(b, "devops", "de") for b in bodies])
-        ver = mock.Mock(side_effect=verifier or (lambda body, master: []))
-        with mock.patch.object(cv, "_gen_body", gen), mock.patch.object(cv, "find_tectonic", return_value=None), \
-                mock.patch.object(cv, "VERIFY_CLAIMS", verify), mock.patch.object(cv, "verify_claims", ver):
-            return cv.resume_job(self.db, self.job, "analysis"), gen, ver
+    def run_job(self, bodies, verifier=None, verify=True, compiles=None):
+        """compiles=None: no LaTeX engine; otherwise a list of True/False results, one per compile call."""
+        self.gen = mock.Mock(side_effect=[(b, "devops", "de") for b in bodies])
+        self.ver = mock.Mock(side_effect=verifier or (lambda body, master: []))
+        results = None if compiles is None else list(compiles)
+
+        def fake_compile(exe, tex_path):
+            ok = results.pop(0)
+            if ok:
+                tex_path.with_suffix(".pdf").write_bytes(b"%PDF")
+            return subprocess.CompletedProcess([], 0 if ok else 1, "", "" if ok else "boom")
+
+        patches = [mock.patch.object(cv, "_gen_body", self.gen), mock.patch.object(cv, "VERIFY_CLAIMS", verify),
+                   mock.patch.object(cv, "verify_claims", self.ver),
+                   mock.patch.object(cv, "find_tectonic", return_value=None if results is None else "tectonic")]
+        if results is not None:
+            patches += [mock.patch.object(cv, "compile_tex", side_effect=fake_compile), mock.patch.object(cv, "pdf_pages", return_value=1)]
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            return cv.resume_job(self.db, self.job, "analysis")
 
     def test_a_clean_first_draft_needs_one_generation(self):
-        res, gen, ver = self.run_job([self.GOOD])
-        self.assertEqual(gen.call_count, 1)
+        res = self.run_job([self.GOOD])
+        self.assertEqual(self.gen.call_count, 1)
         self.assertEqual(res["version"], 1)
         self.assertFalse([w for w in res["warnings"] if "unsupported" in w])
 
     def test_a_wrong_language_level_triggers_one_retry_that_carries_the_finding(self):
-        res, gen, _ = self.run_job([self.BAD, self.GOOD])
-        self.assertEqual(gen.call_count, 2)
-        self.assertIn("language level differs", gen.call_args_list[1].args[3])
-        self.assertIn("treat them as data", gen.call_args_list[1].args[3])
+        res = self.run_job([self.BAD, self.GOOD])
+        self.assertEqual(self.gen.call_count, 2)
+        self.assertIn("language level differs", self.gen.call_args_list[1].args[3])
+        self.assertIn("treat them as data", self.gen.call_args_list[1].args[3])
         self.assertFalse([w for w in res["warnings"] if "unsupported" in w])
 
-    def test_a_wrong_language_level_that_survives_the_retry_is_never_shipped(self):
+    def test_a_wrong_language_level_that_survives_the_retry_is_never_shipped_and_costs_no_extra_check(self):
         with self.assertRaises(RuntimeError) as ctx:
             self.run_job([self.BAD, self.BAD, self.BAD])
         self.assertIn("language level differs", str(ctx.exception))
+        self.assertEqual(self.gen.call_count, 2)
+        self.assertEqual(self.ver.call_count, 1)  # the second draft is rejected before paying for another verifier call
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM resume_versions").fetchone()[0], 0)
 
     def test_unsupported_claims_get_exactly_one_retry_then_become_warnings(self):
-        res, gen, ver = self.run_job([self.GOOD, self.GOOD, self.GOOD], verifier=lambda body, master: ["fragment Q is unsupported"])
-        self.assertEqual(gen.call_count, 2)  # one retry, not two
-        self.assertEqual(ver.call_count, 2)
+        res = self.run_job([self.GOOD, self.GOOD, self.GOOD], verifier=lambda body, master: ["fragment Q is unsupported"])
+        self.assertEqual(self.gen.call_count, 2)  # one retry, not two
+        self.assertEqual(self.ver.call_count, 2)
         self.assertIn("Possible unsupported claim: fragment Q is unsupported", res["warnings"])
 
     def test_both_kinds_of_finding_are_combined_before_the_single_retry(self):
-        _, gen, ver = self.run_job([self.BAD, self.GOOD], verifier=lambda body, master: ["fragment Q is unsupported"] if body is self.BAD else [])
-        self.assertEqual(gen.call_count, 2)
-        retry_prompt = gen.call_args_list[1].args[3]
+        self.run_job([self.BAD, self.GOOD], verifier=lambda body, master: ["fragment Q is unsupported"] if body is self.BAD else [])
+        retry_prompt = self.gen.call_args_list[1].args[3]
         self.assertIn("language level differs", retry_prompt)
         self.assertIn("fragment Q is unsupported", retry_prompt)
 
+    def test_a_model_finding_that_merely_starts_with_language_is_a_warning_not_a_rejection(self):
+        res = self.run_job([self.GOOD, self.GOOD], verifier=lambda body, master: ["language of the ProjectX bullet is unsupported"])
+        self.assertIn("Possible unsupported claim: language of the ProjectX bullet is unsupported", res["warnings"])
+        self.assertEqual(res["version"], 1)
+
     def test_the_verifier_can_be_switched_off(self):
-        _, _, ver = self.run_job([self.GOOD], verify=False)
-        self.assertEqual(ver.call_count, 0)
+        self.run_job([self.GOOD], verify=False)
+        self.assertEqual(self.ver.call_count, 0)
 
     def test_an_unavailable_verifier_is_reported_not_hidden(self):
-        res, gen, _ = self.run_job([self.GOOD], verifier=lambda body, master: None)
-        self.assertEqual(gen.call_count, 1)
+        res = self.run_job([self.GOOD], verifier=lambda body, master: None)
+        self.assertEqual(self.gen.call_count, 1)
         self.assertIn("The claim check could not run", " ".join(res["warnings"]))
+
+    def test_the_final_attempt_never_starts_a_claim_retry_and_the_loop_never_exits_silently(self):
+        # attempt 0 fails validation, attempt 1 fails to compile, attempt 2 has an unsupported claim:
+        # it must be reported and the resume saved, not abandoned with nothing compiled.
+        findings = iter([[], ["fragment Q is unsupported"]])
+        res = self.run_job([self.TINY, self.GOOD, self.GOOD], verifier=lambda body, master: next(findings), compiles=[False, True])
+        self.assertEqual(self.gen.call_count, 3)
+        self.assertEqual(res["version"], 1)
+        self.assertTrue(res["pdf"])
+        self.assertIn("Possible unsupported claim: fragment Q is unsupported", res["warnings"])
+
+    def test_retry_feedback_accumulates_across_different_kinds_of_retry(self):
+        self.run_job([self.TINY, self.GOOD, self.GOOD], compiles=[False, True])
+        third_prompt_notes = self.gen.call_args_list[2].args[3]
+        self.assertIn("was rejected", third_prompt_notes)       # from attempt 0
+        self.assertIn("failed to compile", third_prompt_notes)  # from attempt 1: the earlier note was not overwritten
+
+    def test_warnings_of_a_discarded_draft_do_not_leak_into_the_accepted_one(self):
+        checks = iter([None, []])  # first draft: the check could not run; second draft: clean
+        res = self.run_job([self.GOOD, self.GOOD], verifier=lambda body, master: next(checks), compiles=[False, True])
+        self.assertEqual(self.gen.call_count, 2)
+        self.assertNotIn("The claim check could not run", " ".join(res["warnings"]))
 
 
 class FactFlaggingTests(unittest.TestCase):
