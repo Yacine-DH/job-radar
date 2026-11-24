@@ -153,7 +153,7 @@ class ClaimCheckTests(unittest.TestCase):
         reply = json.dumps([
             {"fragment": "Spanisch (B2)", "problem": "the master says C1"},
             {"fragment": "X", "problem": "supported, no issue"}, {"fragment": "Y", "problem": "None"},
-            {"fragment": "Z", "problem": "no issue here"}, {"fragment": "", "problem": "something"}, {"problem": "orphan"},
+            {"fragment": "Z", "problem": "no issue here"}, {"fragment": "", "problem": "something"},
             {"fragment": "ProjectX: 'no cloud'", "problem": "'no cloud' belongs to another project"}])
         with mock.patch.object(radar, "ask_claude", return_value=reply):
             out = cv.verify_claims("body", r"\begin{document}m\end{document}")
@@ -164,6 +164,35 @@ class ClaimCheckTests(unittest.TestCase):
             cv.verify_claims("body", r"\begin{document}m\end{document}")
         self.assertIn('"fragment"', ask.call_args.args[0])
         self.assertIn("must not appear at all", ask.call_args.args[0])
+
+    def test_real_findings_that_begin_with_none_nothing_correct_supported_or_fine_are_kept(self):
+        real = ["Nothing in the master mentions 'on-prem only'", "None of the master projects use Go",
+                "Correct level in the master is C1, not B2", "Supported for ProjectY, not ProjectX", "Fine-tuning is not in the master"]
+        noise = ["none", "Nothing.", "N/A", "supported, no issue", "No issues", "fine", "Correct", "is supported"]
+        reply = json.dumps([{"fragment": f"F{i}", "problem": p} for i, p in enumerate(real + noise)])
+        with mock.patch.object(radar, "ask_claude", return_value=reply):
+            out = cv.verify_claims("body", r"\begin{document}m\end{document}")
+        self.assertEqual(len(out), len(real))
+        self.assertEqual([o.split(": ", 1)[1] for o in out], real)
+
+    def test_a_reply_with_renamed_keys_is_an_unusable_check_not_a_clean_pass(self):
+        for reply in ('[{"claim": "Spanisch (B2)", "reason": "master says C1"}]', '[{"Fragment": "x", "Problem": "y"}]',
+                      '[{"fragment": "x"}]', '[{"fragment": "x", "problem": 5}]'):
+            with mock.patch.object(radar, "ask_claude", return_value=reply):
+                self.assertIsNone(cv.verify_claims("body", r"\begin{document}m\end{document}"), reply)
+        with mock.patch.object(radar, "ask_claude", return_value="[]"):
+            self.assertEqual(cv.verify_claims("body", r"\begin{document}m\end{document}"), [])
+
+    def test_extra_fields_in_a_valid_finding_are_tolerated(self):
+        reply = '[{"fragment": "Spanisch (B2)", "problem": "the master says C1", "line": 12, "supported": false}]'
+        with mock.patch.object(radar, "ask_claude", return_value=reply):
+            self.assertEqual(cv.verify_claims("body", r"\begin{document}m\end{document}"), ["Spanisch (B2): the master says C1"])
+
+    def test_qualifier_before_the_level_does_not_hide_a_changed_level(self):
+        self.assertEqual(len(cv.language_level_issues("Deutsch: fließend (C1)", self.MASTER_LANGS)), 1)
+        self.assertEqual(len(cv.language_level_issues("Englisch: fluent (C1)", self.MASTER_LANGS)), 1)  # not in the master
+        self.assertEqual(cv.language_level_issues("Deutsch: fließend (B2)", self.MASTER_LANGS), [])
+        self.assertEqual(cv.language_level_issues("Spanisch - Grundkenntnisse", self.MASTER_LANGS), [])
 
     def test_a_numeric_citation_in_the_prose_does_not_hijack_the_json_parsing(self):
         self.assertEqual(cv._json_list('Ref [1]: ["Spanisch (B2) differs"]'), ["Spanisch (B2) differs"])
@@ -253,6 +282,14 @@ class ResumeLoopTests(unittest.TestCase):
         self.assertIn("language level differs", str(ctx.exception))
         self.assertEqual(self.gen.call_count, 2)
         self.assertEqual(self.ver.call_count, 1)  # the second draft is rejected before paying for another verifier call
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM resume_versions").fetchone()[0], 0)
+
+    def test_a_wrong_language_level_on_the_final_attempt_is_rejected_even_without_an_earlier_claim_retry(self):
+        # attempt 0 fails validation, attempt 1 fails to compile, attempt 2 has a wrong level: no retry is left
+        with self.assertRaises(RuntimeError) as ctx:
+            self.run_job([self.TINY, self.GOOD, self.BAD], compiles=[False])
+        self.assertIn("language level differs", str(ctx.exception))
+        self.assertEqual(self.ver.call_count, 1)  # only attempt 1 paid for a verifier call
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM resume_versions").fetchone()[0], 0)
 
     def test_unsupported_claims_get_exactly_one_retry_then_become_warnings(self):

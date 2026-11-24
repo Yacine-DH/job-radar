@@ -206,7 +206,7 @@ def _language_mentions(tex: str) -> list[tuple[str, str, str, set[str]]]:
     Parentheticals that are not proficiency levels ('English (remote)') are ignored."""
     text = _plain_text(tex.replace("~", " "))
     out = []
-    for pat in (r"([A-Za-zÄÖÜäöüéè]+)\s*\(([^)]*)\)", r"([A-Za-zÄÖÜäöüéè]+)\s*[:–—-]{1,2}\s*((?i:[ABC][12]|muttersprach\w*|native)\b[^,;.|\n/\\]*)"):
+    for pat in (r"([A-Za-zÄÖÜäöüéè]+)\s*\(([^)]*)\)", r"([A-Za-zÄÖÜäöüéè]+)\s*[:–—-]{1,2}\s*([^,;.|\n/\\]*)"):
         for name, level in re.findall(pat, text):
             key = LANG_NAMES.get(name.lower())
             if not key:
@@ -234,7 +234,9 @@ def language_level_issues(body: str, master: str) -> list[str]:
 
 # The model sometimes lists fragments it found fine ("... is supported (no issue)"): those are not findings. Only an
 # explicit "no issue" ending counts: "only C1 is supported" is a real finding and must survive.
-_NO_PROBLEM = re.compile(r"^\W*(?:none|n/?a|nothing|no (?:issues?|problems?)|fine|ok(?:ay)?|correct|(?:is |are )?supported)\b", re.I)
+_NO_PROBLEM = re.compile(  # "no issue ..." anything, or the WHOLE text is only none/supported/fine: "Nothing in the master mentions X" is a finding
+    r"^\W*(?:no (?:issues?|problems?)\b.*|(?:(?:none|n/?a|nothing|no (?:issues?|problems?)|fine|ok(?:ay)?|correct|(?:is |are )?supported)\W*)+)$",
+    re.I | re.S)
 _NOT_A_FINDING = re.compile(r"\bno (?:issues?|problems?)\s*[.)\]]*\s*$", re.I)
 
 
@@ -247,7 +249,8 @@ def _json_list(text: str) -> list | None:
     block, or the first valid array among other brackets. Numeric arrays such as a prose citation '[1]' are not findings."""
     def findings(val) -> list | None:
         ok = isinstance(val, list) and all(
-            isinstance(x, str) or (isinstance(x, dict) and all(isinstance(v, str) for v in x.values())) for x in val)
+            isinstance(x, str) or (isinstance(x, dict) and isinstance(x.get("fragment"), str) and isinstance(x.get("problem"), str))
+            for x in val)
         return val if ok else None
 
     for candidate in [text.strip(), *re.findall(r"```(?:json)?\s*(.*?)```", text, re.S)]:
@@ -277,7 +280,7 @@ def verify_claims(body: str, master: str) -> list[str] | None:
             "project to another, a changed language level, year or number, an added qualifier (for example 'on-prem only'), "
             "a skill or activity attributed to a project it does not belong to. Translation, shortening, reordering and "
             "merging bullets of the SAME project are fine. Output ONLY a JSON array of objects "
-            "{\"fragment\": \"<the resume fragment, quoted>\", \"problem\": \"<what the master says instead>\"}. A fragment that is "
+            "{\"fragment\": \"<the resume fragment, quoted>\", \"problem\": \"<why it is unsupported, or what the master says instead>\"}. A fragment that is "
             "supported must not appear at all; output [] if everything is supported. The LaTeX uses \\T{english}{deutsch} for both "
             "languages and \\if.. switches for role variants.\n\n"
             f"BEGIN MASTER\n{_strip_tex_comments(split_master(master)[1])}\nEND MASTER\n\n"
