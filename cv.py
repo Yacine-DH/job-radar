@@ -17,6 +17,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -221,11 +222,16 @@ def _wrapper_meta(tex_path: Path) -> tuple[str | None, str | None]:
 
 
 def _private_copy(src: Path, dst: Path) -> None:
-    """Copy through a 0600 temp file and os.replace, so a reader never sees a half-written file."""
-    tmp = dst.with_name(dst.name + ".tmp")
-    shutil.copyfile(src, tmp)
-    tmp.chmod(0o600)
-    os.replace(tmp, dst)
+    """Copy through a private temp file next to `dst` and os.replace it in, so a reader never sees a partial file.
+    mkstemp creates the file as 0600 from the start (no window under a looser umask) and the name is unique."""
+    fd, tmp = tempfile.mkstemp(dir=dst.parent, prefix=f".{dst.name}.")
+    try:
+        with os.fdopen(fd, "wb") as out, open(src, "rb") as inp:
+            shutil.copyfileobj(inp, out)
+        os.replace(tmp, dst)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
 
 
 def snapshot_version(db: sqlite3.Connection, job_id: str, role: str | None = None, lang: str | None = None,

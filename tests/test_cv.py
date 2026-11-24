@@ -171,7 +171,16 @@ class VersionHistoryTests(unittest.TestCase):
         cv.snapshot_version(self.db, self.job, "swe", "en", [])
         for ext in ("tex", "pdf"):
             self.assertEqual(stat.S_IMODE(self.archived(1, ext).stat().st_mode), 0o600)
-        self.assertFalse(list(radar.TAILORED_DIR.glob("*.tmp")))  # no temp files left behind
+        self.assertEqual([p.name for p in radar.TAILORED_DIR.iterdir() if p.name.startswith(".")], [])  # no temp files left behind
+
+    def test_a_failed_copy_leaves_no_temp_file_and_keeps_the_old_target(self):
+        src, dst = radar.TAILORED_DIR / "src.bin", radar.TAILORED_DIR / "dst.bin"
+        src.write_bytes(b"new")
+        dst.write_bytes(b"old")
+        with mock.patch.object(os, "replace", side_effect=OSError("disk full")), self.assertRaises(OSError):
+            cv._private_copy(src, dst)
+        self.assertEqual(dst.read_bytes(), b"old")
+        self.assertEqual([p.name for p in radar.TAILORED_DIR.iterdir() if p.name.startswith(".")], [])
 
     def test_baseline_ignores_missing_files_and_survives_bad_warnings_json(self):
         cv.ensure_baseline(self.db, self.job)  # nothing on disk: no version
