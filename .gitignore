@@ -6,3 +6,4 @@ __pycache__/
 .orca/
 cv/
 profile.md
+.agent/
