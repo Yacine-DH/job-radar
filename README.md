@@ -56,7 +56,8 @@ The unit files hard-code `/home/user/job-radar` and the server's Tailscale IP: e
 python3 -I radar.py --dry-run          # fetch, rank, print the email; send and record nothing
 python3 -I radar.py --rescore          # re-rank jobs still marked "new" (after a CV or profile change)
 python3 -I cv.py tailor JOB_ID         # fit analysis for one job
-python3 -I cv.py resume JOB_ID         # analysis plus a tailored resume
+python3 -I cv.py resume JOB_ID         # analysis plus a tailored resume (older versions stay in History)
+python3 -I cv.py resume JOB_ID --notes-file notes.txt   # same, with your instructions for this one resume
 python3 -I cv.py recompile             # build missing PDFs from .tex files already on disk
 python3 -I cv.py skills                # most demanded skills your CV lacks
 journalctl --user -u job-radar.service # logs of the daily run

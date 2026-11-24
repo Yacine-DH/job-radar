@@ -30,7 +30,9 @@ Runs on the home server `my-server` (Ubuntu, 24/7). Private repo: `git@github.co
 ## Run / operate
 - Dry run (fetch + rank, print email, send nothing): `python3 -I radar.py --dry-run`
 - Re-rank jobs still `new` (after CV/profile change): `python3 -I radar.py --rescore`
-- CV tools: `python3 -I cv.py build|tailor JOB_ID|resume JOB_ID|skills`
+- CV tools: `python3 -I cv.py build|tailor JOB_ID|resume JOB_ID [--notes TEXT|--notes-file F]|recompile|skills`.
+  `--notes` passes the owner's instructions for one resume (what to emphasise or group); they are a prompt block
+  placed before the posting and never override the no-invention rule, link allow-list or fact check.
 - Timer: Mon-Fri 08:00 Europe/Berlin (`job-radar.timer`). The daily email is sent even when nothing is new
   (heartbeat) and names failed sources. Logs: `journalctl --user -u job-radar.service`.
 - Dashboard: `http://100.64.0.1:8090/` (Tailscale only). Worker: `journalctl --user -u job-radar-worker`.
@@ -67,7 +69,9 @@ ask the owner which one to use. (An earlier version hard-coded the address in th
 ## Data model (`jobs.db`)
 `jobs` (id `source:ref`, score, reason, cv_track swe|devops|ml, gaps JSON, status new|interested|applied|
 not_relevant, notified, distance_km...), `tailoring` (markdown analysis per job), `tailor_jobs` (queue:
-queued|running|done|failed, pdf flag, warnings JSON), `runs` (one row per real daily run: per-source counts and
+queued|running|done|failed, pdf flag, warnings JSON), `resume_versions` (every successful resume generation is
+archived as `cv/tailored/<token>.v<N>.tex|pdf`, last 10 kept, lazy v1 backfill before the first overwrite; the dashboard
+shows a collapsed **History (N)** control), `runs` (one row per real daily run: per-source counts and
 failed sources, shown in the dashboard header/sidebar; dry runs do not write it). Ranking prompts include the
 user's past status decisions. Email shows at most `TOP_N` cards scoring >= `MIN_SCORE` (50), rest as "+N more".
 
@@ -76,6 +80,9 @@ user's past status decisions. Email shows at most `TOP_N` cards scoring >= `MIN_
   the published digest). The master CV uses `fontspec`, so `pdflatex` cannot compile it. First compile fetches TeX
   support files (~2 min), later ones are cached. If tectonic is missing, resumes fall back to `.tex` only.
 - Fact check of generated resumes is a heuristic (flags numbers/tool names absent from the master CV).
+- Clickable names: the master CV defines `\plink{url}{text}` (name + small arrow) for projects/events that have a repo
+  or site; every `\plink` URL in a generated resume must already exist in the master (validator). Private projects get
+  no link. The master on the server and the owner's laptop copy can diverge: tell the owner to sync after edits.
 - The server has no Node or browser, so the dashboard's client-side JS has only had static checks (bracket balance,
   DOM hooks present, server HTML verified with curl). Verify interactions on a real phone/laptop after changes.
 - Auto-mode blocks unrequested downloads and `pip install` here (the tectonic download only went through after the
@@ -85,3 +92,14 @@ user's past status decisions. Email shows at most `TOP_N` cards scoring >= `MIN_
 - Next ideas: weekly skill-gap section in the email, dashboard password, more employer career-page sources.
 
 Commits end with: `Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>` (plus the session trailer if given).
+
+## Working with other agents (Antigravity / Gemini)
+- Shared rules and the hand-off protocol live in `AGENTS.md` (brief/report mailbox in `.agent/`, signed issue/PR
+  messages, cross-review format). The epic for GitHub-derived skills is issue #28.
+- The CLI is `agy`. Run it **non-interactively** (`agy -p`), never with `--dangerously-skip-permissions`:
+  implementation tasks in a throwaway `git clone --depth 1 file://...` (no secrets, no history) with
+  `--mode accept-edits --sandbox`; reviews in an empty directory with `--mode plan` and the diff pasted into the prompt.
+  Always check the prompt for personal data and for missing content (`gh` needs `-R owner/repo` inside a clone).
+- The owner may have their own interactive `agy` session open in another project: never touch or kill it. Match
+  processes precisely before `kill` (a loose `pgrep -f` pattern also matches your own shell).
+- Work on branches in a separate `git worktree`, not in the live checkout: the running services load code from it.
