@@ -17,6 +17,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # run with -I, so add our own dir explicitly
@@ -209,6 +210,60 @@ def compile_tex(exe: str, tex_path: Path) -> subprocess.CompletedProcess:
                           capture_output=True, text=True, timeout=300, cwd=tex_path.parent)
 
 
+def _wrapper_meta(tex_path: Path) -> tuple[str | None, str | None]:
+    """role and language from the generated wrapper line (\\def\\cvrole{..}\\def\\cvlang{..})."""
+    try:
+        first = tex_path.read_text().splitlines()[0]
+    except (OSError, IndexError):
+        return None, None
+    m = re.search(r"\\cvrole\{(\w+)\}.*?\\cvlang\{(\w+)\}", first)
+    return (m.group(1), m.group(2)) if m else (None, None)
+
+
+def snapshot_version(db: sqlite3.Connection, job_id: str, role: str | None = None, lang: str | None = None,
+                     warnings: list | None = None, created: str | None = None) -> int | None:
+    """Archive the current resume files as the next numbered version and record it; keeps the last KEEP_VERSIONS."""
+    token = radar.file_token(job_id)
+    cur_tex = radar.TAILORED_DIR / f"{token}.tex"
+    if not cur_tex.exists():
+        return None
+    n = db.execute("SELECT COALESCE(MAX(n), 0) + 1 FROM resume_versions WHERE job_id = ?", (job_id,)).fetchone()[0]
+    for ext in ("tex", "pdf"):
+        src = radar.TAILORED_DIR / f"{token}.{ext}"
+        if src.exists():
+            dst = radar.version_path(token, n, ext)
+            shutil.copy2(src, dst)
+            dst.chmod(0o600)
+    if role is None or lang is None:
+        r2, l2 = _wrapper_meta(cur_tex)
+        role, lang = role or r2, lang or l2
+    db.execute("INSERT INTO resume_versions (job_id, n, created, role, lang, pdf, warnings) "
+               "VALUES (?, ?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?)",
+               (job_id, n, created, role, lang, int((radar.TAILORED_DIR / f"{token}.pdf").exists()),
+                json.dumps(warnings or [], ensure_ascii=False)))
+    for (old,) in db.execute("SELECT n FROM resume_versions WHERE job_id = ? ORDER BY n DESC LIMIT -1 OFFSET ?",
+                             (job_id, radar.KEEP_VERSIONS)).fetchall():
+        for ext in ("tex", "pdf"):
+            radar.version_path(token, old, ext).unlink(missing_ok=True)
+        db.execute("DELETE FROM resume_versions WHERE job_id = ? AND n = ?", (job_id, old))
+    db.commit()
+    return n
+
+
+def ensure_baseline(db: sqlite3.Connection, job_id: str) -> None:
+    """Before overwriting, register resume files that predate version tracking as version 1."""
+    tex = radar.TAILORED_DIR / f"{radar.file_token(job_id)}.tex"
+    if not tex.exists() or db.execute("SELECT 1 FROM resume_versions WHERE job_id = ?", (job_id,)).fetchone():
+        return
+    created = datetime.fromtimestamp(tex.stat().st_mtime, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    row = db.execute("SELECT warnings FROM tailor_jobs WHERE job_id = ?", (job_id,)).fetchone()
+    try:
+        warnings = json.loads(row["warnings"] or "[]") if row else []
+    except ValueError:
+        warnings = []
+    snapshot_version(db, job_id, warnings=warnings, created=created)
+
+
 def _gen_body(job: sqlite3.Row, analysis: str, master: str, extra: str = "") -> tuple[str, str, str]:
     pre, master_body = split_master(master)
     prompt = (
@@ -245,6 +300,7 @@ def resume_job(db: sqlite3.Connection, job: sqlite3.Row, analysis: str) -> dict:
     token = radar.file_token(job["id"])
     tex_path = radar.TAILORED_DIR / f"{token}.tex"
     pdf_path = tex_path.with_suffix(".pdf")
+    ensure_baseline(db, job["id"])  # keep what exists today as a version before it is overwritten
     pdf_path.unlink(missing_ok=True)
     warnings: list[str] = []
     extra, body, role, lang = "", "", "swe", "en"
@@ -281,7 +337,8 @@ def resume_job(db: sqlite3.Connection, job: sqlite3.Row, analysis: str) -> dict:
     odd = unverified(body, master)
     if odd:
         warnings.append("Not found in your master CV, please verify: " + ", ".join(odd[:15]))
-    return {"pdf": pdf_path.exists(), "warnings": warnings, "role": role, "lang": lang}
+    version = snapshot_version(db, job["id"], role, lang, warnings)
+    return {"pdf": pdf_path.exists(), "warnings": warnings, "role": role, "lang": lang, "version": version}
 
 
 def run_request(db: sqlite3.Connection, job_id: str) -> dict:
@@ -339,6 +396,10 @@ def recompile(ref: str | None) -> int:
             warnings.append(f"The PDF is {pages} pages; trim it by hand.")
         db.execute("UPDATE tailor_jobs SET pdf = 1, warnings = ? WHERE job_id = ?",
                    (json.dumps(warnings, ensure_ascii=False), jid))
+        latest = db.execute("SELECT MAX(n) FROM resume_versions WHERE job_id = ?", (jid,)).fetchone()[0]
+        if latest:  # the newest archived version gets its PDF too
+            shutil.copy2(pdf, radar.version_path(radar.file_token(jid), latest, "pdf"))
+            db.execute("UPDATE resume_versions SET pdf = 1 WHERE job_id = ? AND n = ?", (jid, latest))
         db.commit()
         print(f"{jid}: PDF built ({pages} page{'s' if pages != 1 else ''}){' with warnings' if warnings else ''}")
     return 0

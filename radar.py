@@ -442,6 +442,10 @@ def open_db() -> sqlite3.Connection:
     db.execute("""CREATE TABLE IF NOT EXISTS tailor_jobs (
         job_id TEXT PRIMARY KEY, state TEXT NOT NULL, requested TEXT DEFAULT CURRENT_TIMESTAMP,
         finished TEXT, error TEXT, pdf INTEGER NOT NULL DEFAULT 0, warnings TEXT)""")
+    # Every successful resume generation is archived as a numbered version (see cv.snapshot_version).
+    db.execute("""CREATE TABLE IF NOT EXISTS resume_versions (
+        job_id TEXT NOT NULL, n INTEGER NOT NULL, created TEXT DEFAULT CURRENT_TIMESTAMP,
+        role TEXT, lang TEXT, pdf INTEGER NOT NULL DEFAULT 0, warnings TEXT, PRIMARY KEY (job_id, n))""")
     if "distance_km" not in cols:
         db.execute("ALTER TABLE jobs ADD COLUMN distance_km REAL")
         for r in db.execute("SELECT id, description FROM jobs WHERE source = 'BA'").fetchall():
@@ -518,6 +522,14 @@ def ask_claude(prompt: str, system: str = SYSTEM_PROMPT, timeout: int = 300) -> 
 
 TRACKS = ("swe", "devops", "ml")
 TAILORED_DIR = CV_DIR / "tailored"  # generated resumes (git-ignored with cv/)
+
+
+KEEP_VERSIONS = 10  # archived resume versions kept per job
+
+
+def version_path(token: str, n: int, ext: str) -> Path:
+    """Archived copy of a generated resume (`<token>.v<n>.tex|pdf`); the current files keep `<token>.tex|pdf`."""
+    return TAILORED_DIR / f"{token}.v{n}.{ext}"
 
 
 def file_token(job_id: str) -> str:

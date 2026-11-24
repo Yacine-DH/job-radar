@@ -94,5 +94,44 @@ class RenderingTests(unittest.TestCase):
         self.assertIn("A &amp; B", out)
 
 
+class HistoryRenderingTests(unittest.TestCase):
+    def v(self, n, pdf=1, role="devops", lang="de", created="2026-11-16 09:03:00"):
+        return Row(job_id="t:1", n=n, created=created, role=role, lang=lang, pdf=pdf)
+
+    def done(self, versions):
+        return d.render_tailor(Row(id="t:1", score=78, tj_state="done", tj_pdf=1, tj_warnings="[]",
+                                   tj_finished="2026-11-24 16:14:00"), versions)
+
+    def test_filename_whitelist_accepts_versions_only_in_the_strict_form(self):
+        for ok in ("0123456789abcdef.v1.pdf", "0123456789abcdef.v12.tex", "0123456789abcdef.v999.pdf"):
+            self.assertTrue(d.FILE_NAME_RE.match(ok), ok)
+        for bad in ("0123456789abcdef.v.pdf", "0123456789abcdef.v1234.pdf", "0123456789abcdef.v1.sh",
+                    "0123456789abcdef..v1.pdf", "../0123456789abcdef.v1.pdf", "0123456789abcdef.v-1.pdf"):
+            self.assertIsNone(d.FILE_NAME_RE.match(bad), bad)
+
+    def test_history_is_collapsed_by_default_and_lists_every_version(self):
+        out = self.done([self.v(2, role="swe", lang="en"), self.v(1)])
+        self.assertIn('<details class="hist">', out)  # no "open" attribute: the owner pops it up
+        self.assertIn("History (2)", out)
+        self.assertIn(".v1.pdf", out)
+        self.assertIn(".v2.tex", out)
+        self.assertEqual(out.count(">current</span>"), 1)  # only the newest is tagged
+
+    def test_no_history_control_when_there_is_only_one_version(self):
+        self.assertNotIn("hist", self.done([self.v(1)]))
+        self.assertNotIn("hist", self.done([]))
+        self.assertNotIn("hist", d.render_tailor(Row(id="t:1", score=5), [self.v(1), self.v(2)]))  # idle card
+
+    def test_failed_regeneration_still_offers_the_previous_version(self):
+        out = d.render_tailor(Row(id="t:1", score=78, tj_state="failed", tj_error="boom"), [self.v(1)])
+        self.assertIn("History (1)", out)
+        self.assertNotIn(">current</span>", out)  # nothing is current after a failed run
+
+    def test_versions_without_a_pdf_only_link_the_tex(self):
+        out = self.done([self.v(2, pdf=0), self.v(1)])
+        self.assertNotIn(".v2.pdf", out)
+        self.assertIn(".v2.tex", out)
+
+
 if __name__ == "__main__":
     unittest.main()

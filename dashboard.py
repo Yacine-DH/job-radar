@@ -152,12 +152,13 @@ def tailor_fragment(id: str):
     """HTML of one card's tailor slot, so the page can swap it in place while polling."""
     with db() as con:
         row = con.execute(f"{ROW_SQL} WHERE jobs.id = ?", (id,)).fetchone()
+        vers = versions_for(con, [id]) if row else {}
     if row is None:
         return HTMLResponse("", status_code=404)
-    return HTMLResponse(render_tailor(row))
+    return HTMLResponse(render_tailor(row, vers.get(id)))
 
 
-FILE_NAME_RE = re.compile(r"^[0-9a-f]{16}\.(pdf|tex)$")
+FILE_NAME_RE = re.compile(r"^[0-9a-f]{16}(\.v\d{1,3})?\.(pdf|tex)$")  # current files and archived versions
 
 
 @app.get("/files/{name}")
@@ -248,6 +249,7 @@ ICONS = {
     "back": '<path d="M15 6l-6 6 6 6"/>',
     "download": '<path d="M12 4v11"/><path d="M7 10l5 5 5-5"/><path d="M5 20h14"/>',
     "chart": '<path d="M4 19V5"/><path d="M4 19h16"/><path d="M8 15l3-4 3 2 5-6"/>',
+    "clock": '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
     "sliders": '<path d="M4 6h16"/><path d="M7 12h10"/><path d="M10 18h4"/>',
 }
 
@@ -366,7 +368,38 @@ def split_warnings(raw: str | None) -> tuple[list[str], list[str], bool]:
     return claims, notes, no_engine
 
 
-def render_tailor(r) -> str:
+def versions_for(con: sqlite3.Connection, ids: list[str] | None = None) -> dict[str, list]:
+    """Archived resume versions per job, newest first."""
+    sql = "SELECT job_id, n, created, role, lang, pdf FROM resume_versions"
+    args: list = []
+    if ids:
+        sql += " WHERE job_id IN (" + ",".join("?" * len(ids)) + ")"
+        args = list(ids)
+    out: dict[str, list] = defaultdict(list)
+    for v in con.execute(sql + " ORDER BY job_id, n DESC", args):
+        out[v["job_id"]].append(v)
+    return out
+
+
+def render_history(r, versions: list, state: str | None) -> str:
+    """Collapsed list of earlier resume versions: shown only when there is something older to look at."""
+    if not (len(versions) >= 2 or (state == "failed" and versions)):
+        return ""
+    token, latest, items = radar.file_token(r["id"]), versions[0]["n"], []
+    for v in versions:
+        d = parse_ts(v["created"])
+        when = f"{d.day} {d.strftime('%b')}, {d:%H:%M}" if d else ""
+        tags = " · ".join(x for x in (str(v["lang"] or "").upper(), v["role"] or "") if x)
+        cur = ' <span class="tag nice">current</span>' if v["n"] == latest and state == "done" else ""
+        links = (f'<a href="/files/{token}.v{v["n"]}.pdf" download>PDF</a>' if v["pdf"] else "") + \
+                f'<a href="/files/{token}.v{v["n"]}.tex" download>.tex</a>'
+        items.append(f'<li><span class="vn">v{v["n"]}</span><span class="muted">{e(when)}{" · " if tags else ""}{e(tags)}</span>'
+                     f'{cur}<span class="vl">{links}</span></li>')
+    return (f'<details class="hist"><summary>{icon("clock", 14)}History ({len(versions)})</summary>'
+            f'<ul>{"".join(items)}</ul></details>')
+
+
+def render_tailor(r, versions: list | None = None) -> str:
     """The tailor slot of a card (swapped in place by the page while a request is pending)."""
     state, token = r["tj_state"], radar.file_token(r["id"])
     box, idle = "", state is None
@@ -381,6 +414,7 @@ def render_tailor(r) -> str:
         box = (f'<div class="box fail" role="alert"><div class="frow">{icon("xcircle", 18)}<div>'
                f'<strong>Couldn\'t tailor this resume.</strong><div class="mono">{e(r["tj_error"] or "unknown error")}</div>'
                '</div></div><button type="button" class="btn" data-act="tailor">Retry</button></div>')
+        box += render_history(r, versions or [], state)
     elif state == "done":
         claims, notes, no_engine = split_warnings(r["tj_warnings"])
         has_pdf = bool(r["tj_pdf"])
@@ -408,7 +442,8 @@ def render_tailor(r) -> str:
                    f'{render_fit(r["tailoring_md"], band(r["score"]))}</details>{regen}</div>')
         else:
             fit = f'<div class="fitwrap">{regen}</div>'
-        box = f'<section class="box done" aria-label="Tailored resume">{stamp}<div class="dl">{pdf}{tex}</div>{warn}{fit}</section>'
+        box = (f'<section class="box done" aria-label="Tailored resume">{stamp}<div class="dl">{pdf}{tex}</div>{warn}{fit}'
+               f'{render_history(r, versions or [], state)}</section>')
     elif r["tailoring_md"]:  # analysis made on the command line, no resume requested from the dashboard
         box = (f'<div class="fitwrap alone"><details class="fit"><summary>{icon("chevron", 14, 2.4)}Fit analysis &amp; what to learn</summary>'
                f'{render_fit(r["tailoring_md"], band(r["score"]))}</details></div>')
@@ -432,7 +467,7 @@ def seg(status: str) -> str:
     return f'<div class="seg" role="group" aria-label="Status">{"".join(btns)}</div>'
 
 
-def render_card(r, hidden: bool = False) -> str:
+def render_card(r, hidden: bool = False, versions: list | None = None) -> str:
     score, bnd = r["score"], band(r["score"])
     fs = parse_ts(r["first_seen"])
     fresh = r["status"] == "new" and fs is not None and datetime.now(BERLIN) - fs < timedelta(hours=48)
@@ -465,7 +500,7 @@ data-first="{e(r['first_seen'] or '', quote=True)}"{' hidden' if hidden else ''}
     <div class="meta">{where}<span>{e(r['source'] or '')}</span><span>{e(fmt_day(r['first_seen']))}</span></div>
     <p class="reason{' muted' if score is None else ''}">{e(reason)}</p>
     {cv_line}
-    {render_tailor(r)}
+    {render_tailor(r, versions)}
     {seg(r['status'])}
     {f'<div class="desc" hidden>{e(desc[:2000])}</div>' if desc else ''}
   </div>
@@ -555,6 +590,10 @@ main{padding:8px 16px 24px;display:flex;flex-direction:column;gap:12px}
 .fit summary::-webkit-details-marker{display:none}.fit summary .ic{transition:transform .15s}.fit[open] summary .ic{transform:rotate(90deg)}
 .fitwrap>.lnk{position:absolute;right:0;top:0;font-size:13px}
 .fitwrap.alone>.lnk{display:none}.fitwrap.alone summary{padding-left:12px}
+.hist{font-size:13px}.hist summary{min-height:40px;display:inline-flex;align-items:center;gap:6px;color:var(--muted);cursor:pointer;list-style:none}
+.hist summary::-webkit-details-marker{display:none}.hist[open] summary{color:var(--fg)}
+.hist ul{margin:0;padding:0;list-style:none;display:flex;flex-direction:column}.hist li{display:flex;align-items:center;gap:8px;min-height:36px;border-top:1px solid var(--line)}
+.hist .vn{font-weight:600;min-width:28px}.hist .vl{margin-left:auto;display:flex;gap:14px}
 .md{display:flex;flex-direction:column;gap:12px;font-size:14px;line-height:1.5;padding:4px 0 8px}.fitwrap.alone .md{padding:4px 14px 12px}
 .md h4{margin:0 0 4px;font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}
 .md p{margin:0}.md ul,.md ol{margin:0;padding-left:20px;display:flex;flex-direction:column;gap:3px}
@@ -788,6 +827,7 @@ def index(request: Request, min_score: int = Query(0, ge=0, le=100), source: str
         counts = dict(con.execute("SELECT status, COUNT(*) FROM jobs GROUP BY status").fetchall())
         run = last_run(con)
         gaps = gap_stats(con)
+        vers = versions_for(con)
         today = datetime.now(BERLIN).date()
         triaged = sum(1 for r in con.execute("SELECT status_at FROM jobs WHERE status != 'new' AND status_at IS NOT NULL")
                       if (parse_ts(r[0]) or datetime.min.replace(tzinfo=BERLIN)).date() == today)
@@ -850,7 +890,7 @@ def index(request: Request, min_score: int = Query(0, ge=0, le=100), source: str
 <div><span class="muted">Sources</span><span>{len(radar.SOURCE_NAMES)} configured</span></div>
 <div><span class="muted">Search radius</span><span>{radar.BA_RADIUS_KM} km of Darmstadt</span></div></div></div></main>"""
     else:
-        cards = "".join(render_card(r, hidden=not visible(r)) for r in rows)
+        cards = "".join(render_card(r, hidden=not visible(r), versions=vers.get(r["id"])) for r in rows)
         main = f"""<main><div id="list" data-total="{total}" data-triaged="{triaged}">{cards}</div>
 <div class="empty" id="empty" hidden><h2></h2><p></p><div class="acts"></div></div>
 <p class="endmsg">That's all for today. Next run {e(nxt)}.</p></main>"""
