@@ -15,6 +15,7 @@ MASTER = r"""\documentclass{article}
 \begin{document}
 Projects: \gh{owner/repo} TypeScript, Next.js, Python, C\#, 0{,}958 accuracy, 47 test cases, Docker Compose.
 \href{https://example.org/me}{example.org/me}
+\plink{https://example.org/proj}{Proj}
 \end{document}"""
 PADDING = "\\item Built things with TypeScript and Python in 47 test cases. " * 12
 
@@ -47,6 +48,11 @@ class ValidatorTests(unittest.TestCase):
     def test_rejects_links_that_are_not_in_the_master_cv(self):
         self.assertIn("link not in", self.check("\\href{https://evil.example}{x}"))
         self.assertIn("link not in", self.check("\\gh{evil/repo}"))
+
+    def test_plink_urls_must_come_from_the_master_cv(self):
+        self.assertIsNone(self.check("\\plink{https://example.org/proj}{Proj}"))
+        self.assertIn("link not in", self.check("\\plink{https://evil.example/x}{Proj}"))
+        self.assertIn("link not in", self.check("\\plink{https://example.org/proj/../evil}{Proj}"))
 
     def test_rejects_unbalanced_braces_and_tiny_output(self):
         self.assertEqual(self.check("\\textbf{open"), "unbalanced braces")

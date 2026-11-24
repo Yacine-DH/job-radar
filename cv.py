@@ -153,7 +153,7 @@ def validate_body(body: str, master: str) -> str | None:
             break
     if depth != 0:
         return "unbalanced braces"
-    for m in re.finditer(r"\\(?:href|gh)\{([^}]*)\}", body):
+    for m in re.finditer(r"\\(?:href|gh|plink)\{([^}]*)\}", body):  # every link must already exist in the master CV
         if m.group(1) not in master:
             return f"link not in the master CV: {m.group(1)[:60]}"
     if len(body.strip()) < 500:
@@ -275,7 +275,9 @@ def _gen_body(job: sqlite3.Row, analysis: str, master: str, extra: str = "") -> 
         "- Write that one language directly and flatten the role switches: do NOT use \\T{..}{..}, \\ifde, "
         "\\ifswe, \\ifdevops or \\ifml. Do not define macros or load packages.\n"
         "- Reuse the master's macros and structure: \\entry{title}{org}{date}, \\sub{..}, \\gap, \\gh{owner/repo}, "
-        "itemize lists, \\section{..}. Keep the header block (name, contact line) as in the master.\n"
+        "\\plink{url}{text}, itemize lists, \\section{..}. Keep the header block (name, contact line) as in the master.\n"
+        "- Clickable names: when you include a project, event or website that has a \\plink in the master, keep that "
+        "\\plink with exactly the same URL. Never add, change or invent a link; projects without a \\plink stay plain text.\n"
         "- Choose and order the projects, hackathons and skills most relevant to this job; cut the rest. Reword "
         "bullets with the posting's vocabulary only where the CV supports it.\n"
         "- Facts, numbers, tools and links must come from the master. Never mention anything the CV lacks, even if "
