@@ -84,10 +84,11 @@ class RenderingTests(unittest.TestCase):
         self.assertIn("LaTeX source (.tex)", out)
 
     def test_card_never_leaks_markup_from_job_data(self):
+        self._keep = fresh_db()
         db = radar.open_db()
+        self.addCleanup(db.close)
         from tests.helpers import insert_job
         row = Row(insert_job(db, title='<img src=x onerror=1>', company="A & B", url="javascript:alert(1)"))
-        db.close()
         out = d.render_card(row)
         self.assertNotIn("<img", out)
         self.assertIn('href="#"', out)
@@ -103,11 +104,12 @@ class HistoryRenderingTests(unittest.TestCase):
                                    tj_finished="2026-11-24 16:14:00"), versions)
 
     def test_filename_whitelist_accepts_versions_only_in_the_strict_form(self):
-        for ok in ("0123456789abcdef.v1.pdf", "0123456789abcdef.v12.tex", "0123456789abcdef.v999.pdf"):
+        for ok in ("0123456789abcdef.v1.pdf", "0123456789abcdef.v12.tex", "0123456789abcdef.v1234.pdf", "0123456789abcdef.pdf"):
             self.assertTrue(d.FILE_NAME_RE.match(ok), ok)
-        for bad in ("0123456789abcdef.v.pdf", "0123456789abcdef.v1234.pdf", "0123456789abcdef.v1.sh",
-                    "0123456789abcdef..v1.pdf", "../0123456789abcdef.v1.pdf", "0123456789abcdef.v-1.pdf"):
-            self.assertIsNone(d.FILE_NAME_RE.match(bad), bad)
+        for bad in ("0123456789abcdef.v.pdf", "0123456789abcdef.v0.pdf", "0123456789abcdef.v01.pdf", "0123456789abcdef.v1234567.pdf",
+                    "0123456789abcdef.v1.sh", "0123456789abcdef..v1.pdf", "../0123456789abcdef.v1.pdf", "0123456789abcdef.v-1.pdf",
+                    "0123456789abcdef.pdf\n", "0123456789abcdef.v1.pdf\n"):
+            self.assertIsNone(d.FILE_NAME_RE.match(bad), repr(bad))
 
     def test_history_is_collapsed_by_default_and_lists_every_version(self):
         out = self.done([self.v(2, role="swe", lang="en"), self.v(1)])
@@ -131,6 +133,27 @@ class HistoryRenderingTests(unittest.TestCase):
         out = self.done([self.v(2, pdf=0), self.v(1)])
         self.assertNotIn(".v2.pdf", out)
         self.assertIn(".v2.tex", out)
+
+    def test_versions_for_filters_and_never_widens_an_empty_list(self):
+        self._keep = fresh_db()  # own database: never share state with other tests
+        db = radar.open_db()
+        self.addCleanup(db.close)
+        for job, n in (("t:1", 1), ("t:1", 2), ("t:2", 1)):
+            db.execute("INSERT INTO resume_versions (job_id, n, role, lang, pdf) VALUES (?, ?, 'swe', 'en', 1)", (job, n))
+        db.commit()
+        everything = d.versions_for(db)
+        self.assertEqual({k: [v["n"] for v in vs] for k, vs in everything.items()}, {"t:1": [2, 1], "t:2": [1]})  # newest first
+        self.assertEqual(list(d.versions_for(db, ["t:2"])), ["t:2"])
+        self.assertEqual(d.versions_for(db, []), {})  # an empty id list must not return every job
+
+    def test_history_escapes_metadata_and_has_no_stray_separator(self):
+        bad = Row(job_id="t:1", n=2, created=None, role="<b>x</b>", lang="<i>", pdf=1)
+        out = d.render_history(Row(id="t:1"), [bad, self.v(1)], "done")
+        self.assertNotIn("<b>x", out)
+        self.assertIn("&lt;B&gt;", out.replace("&lt;I&gt;", "&lt;B&gt;"))  # language is upper-cased, then escaped
+        self.assertNotIn('vm"> ·', out)  # empty date: no leading separator
+        self.assertIn('aria-label="Download version 2 as PDF"', out)
+        self.assertIn('aria-label="Download version 1 LaTeX source"', out)
 
 
 if __name__ == "__main__":

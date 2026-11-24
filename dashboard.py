@@ -158,7 +158,7 @@ def tailor_fragment(id: str):
     return HTMLResponse(render_tailor(row, vers.get(id)))
 
 
-FILE_NAME_RE = re.compile(r"^[0-9a-f]{16}(\.v\d{1,3})?\.(pdf|tex)$")  # current files and archived versions
+FILE_NAME_RE = re.compile(r"\A[0-9a-f]{16}(\.v[1-9]\d{0,5})?\.(pdf|tex)\Z")  # current files and archived versions
 
 
 @app.get("/files/{name}")
@@ -249,7 +249,6 @@ ICONS = {
     "back": '<path d="M15 6l-6 6 6 6"/>',
     "download": '<path d="M12 4v11"/><path d="M7 10l5 5 5-5"/><path d="M5 20h14"/>',
     "chart": '<path d="M4 19V5"/><path d="M4 19h16"/><path d="M8 15l3-4 3 2 5-6"/>',
-    "clock": '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
     "sliders": '<path d="M4 6h16"/><path d="M7 12h10"/><path d="M10 18h4"/>',
 }
 
@@ -372,7 +371,9 @@ def versions_for(con: sqlite3.Connection, ids: list[str] | None = None) -> dict[
     """Archived resume versions per job, newest first."""
     sql = "SELECT job_id, n, created, role, lang, pdf FROM resume_versions"
     args: list = []
-    if ids:
+    if ids is not None:
+        if not ids:
+            return {}
         sql += " WHERE job_id IN (" + ",".join("?" * len(ids)) + ")"
         args = list(ids)
     out: dict[str, list] = defaultdict(list)
@@ -385,17 +386,18 @@ def render_history(r, versions: list, state: str | None) -> str:
     """Collapsed list of earlier resume versions: shown only when there is something older to look at."""
     if not (len(versions) >= 2 or (state == "failed" and versions)):
         return ""
-    token, latest, items = radar.file_token(r["id"]), versions[0]["n"], []
+    token, latest, items = radar.file_token(r["id"]), int(versions[0]["n"]), []
     for v in versions:
+        n = int(v["n"])
         d = parse_ts(v["created"])
         when = f"{d.day} {d.strftime('%b')}, {d:%H:%M}" if d else ""
         tags = " · ".join(x for x in (str(v["lang"] or "").upper(), v["role"] or "") if x)
-        cur = ' <span class="tag nice">current</span>' if v["n"] == latest and state == "done" else ""
-        links = (f'<a href="/files/{token}.v{v["n"]}.pdf" download>PDF</a>' if v["pdf"] else "") + \
-                f'<a href="/files/{token}.v{v["n"]}.tex" download>.tex</a>'
-        items.append(f'<li><span class="vn">v{v["n"]}</span><span class="muted">{e(when)}{" · " if tags else ""}{e(tags)}</span>'
-                     f'{cur}<span class="vl">{links}</span></li>')
-    return (f'<details class="hist"><summary>{icon("clock", 14)}History ({len(versions)})</summary>'
+        meta = " · ".join(x for x in (when, tags) if x)
+        cur = ' <span class="tag nice">current</span>' if n == latest and state == "done" else ""
+        links = (f'<a href="/files/{token}.v{n}.pdf" download aria-label="Download version {n} as PDF">PDF</a>' if v["pdf"] else "") + \
+                f'<a href="/files/{token}.v{n}.tex" download aria-label="Download version {n} LaTeX source">.tex</a>'
+        items.append(f'<li><span class="vn">v{n}</span><span class="muted vm">{e(meta)}</span>{cur}<span class="vl">{links}</span></li>')
+    return (f'<details class="hist"><summary>{icon("chevron", 14, 2.4)}History ({len(versions)})</summary>'
             f'<ul>{"".join(items)}</ul></details>')
 
 
@@ -591,9 +593,11 @@ main{padding:8px 16px 24px;display:flex;flex-direction:column;gap:12px}
 .fitwrap>.lnk{position:absolute;right:0;top:0;font-size:13px}
 .fitwrap.alone>.lnk{display:none}.fitwrap.alone summary{padding-left:12px}
 .hist{font-size:13px}.hist summary{min-height:40px;display:inline-flex;align-items:center;gap:6px;color:var(--muted);cursor:pointer;list-style:none}
-.hist summary::-webkit-details-marker{display:none}.hist[open] summary{color:var(--fg)}
-.hist ul{margin:0;padding:0;list-style:none;display:flex;flex-direction:column}.hist li{display:flex;align-items:center;gap:8px;min-height:36px;border-top:1px solid var(--line)}
-.hist .vn{font-weight:600;min-width:28px}.hist .vl{margin-left:auto;display:flex;gap:14px}
+.hist summary::-webkit-details-marker{display:none}.hist summary .ic{transition:transform .15s}.hist[open] summary{color:var(--fg)}.hist[open] summary .ic{transform:rotate(90deg)}
+.hist ul{margin:0;padding:0;list-style:none;display:flex;flex-direction:column}
+.hist li{display:flex;flex-wrap:wrap;align-items:center;gap:0 8px;min-height:40px;border-top:1px solid var(--line)}
+.hist .vn{font-weight:600;min-width:28px}.hist .vl{margin-left:auto;display:flex;gap:4px;flex-shrink:0}
+.hist .vl a{display:inline-flex;align-items:center;min-height:40px;padding:0 8px}
 .md{display:flex;flex-direction:column;gap:12px;font-size:14px;line-height:1.5;padding:4px 0 8px}.fitwrap.alone .md{padding:4px 14px 12px}
 .md h4{margin:0 0 4px;font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}
 .md p{margin:0}.md ul,.md ol{margin:0;padding-left:20px;display:flex;flex-direction:column;gap:3px}

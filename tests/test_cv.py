@@ -1,7 +1,10 @@
 import json
 import os
+import stat
+import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -150,6 +153,63 @@ class VersionHistoryTests(unittest.TestCase):
         self.assertEqual([r["n"] for r in self.rows()], list(range(3, 13)))
         self.assertFalse(self.archived(1, "tex").exists() or self.archived(2, "pdf").exists())
         self.assertEqual(self.archived(12, "tex").read_text(), "v12")
+
+    def test_retention_is_isolated_per_job(self):
+        other = "t:2"
+        other_token = radar.file_token(other)
+        (radar.TAILORED_DIR / f"{other_token}.tex").write_text("other job")
+        cv.snapshot_version(self.db, other, "swe", "en", [])
+        for i in range(1, 13):
+            self.write_current(f"v{i}")
+            cv.snapshot_version(self.db, self.job, "swe", "en", [])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM resume_versions WHERE job_id = ?", (other,)).fetchone()[0], 1)
+        self.assertEqual(radar.version_path(other_token, 1, "tex").read_text(), "other job")
+        self.assertEqual((radar.TAILORED_DIR / f"{other_token}.tex").read_text(), "other job")
+
+    def test_archived_files_are_private(self):
+        self.write_current("secret")
+        cv.snapshot_version(self.db, self.job, "swe", "en", [])
+        for ext in ("tex", "pdf"):
+            self.assertEqual(stat.S_IMODE(self.archived(1, ext).stat().st_mode), 0o600)
+        self.assertFalse(list(radar.TAILORED_DIR.glob("*.tmp")))  # no temp files left behind
+
+    def test_baseline_ignores_missing_files_and_survives_bad_warnings_json(self):
+        cv.ensure_baseline(self.db, self.job)  # nothing on disk: no version
+        self.assertEqual(self.rows(), [])
+        self.write_current("liked")
+        self.db.execute("INSERT INTO tailor_jobs (job_id, state, warnings) VALUES (?, 'done', '{not json')", (self.job,))
+        cv.ensure_baseline(self.db, self.job)
+        self.assertEqual(json.loads(self.rows()[0]["warnings"]), [])
+
+    def test_a_stale_archived_pdf_is_removed_when_the_current_pdf_is_gone(self):
+        self.write_current("one")
+        cv.snapshot_version(self.db, self.job, "swe", "en", [])
+        self.archived(2, "pdf").write_bytes(b"stale leftover of an aborted run")
+        self.write_current("two", pdf=False)
+        (radar.TAILORED_DIR / f"{self.token}.pdf").unlink()
+        cv.snapshot_version(self.db, self.job, "swe", "en", [])
+        self.assertFalse(self.archived(2, "pdf").exists())
+        self.assertEqual(self.rows()[1]["pdf"], 0)
+
+    def test_recompile_updates_the_newest_version_and_its_warnings(self):
+        self.write_current("tex", pdf=False)
+        cv.snapshot_version(self.db, self.job, "devops", "de", ["No LaTeX engine (tectonic) installed on the server: only the .tex was produced."])
+        self.db.execute("INSERT INTO tailor_jobs (job_id, state, pdf, warnings) VALUES (?, 'done', 0, ?)",
+                        (self.job, json.dumps(["No LaTeX engine (tectonic) installed on the server: only the .tex was produced."])))
+        self.db.commit()
+
+        def fake_compile(exe, tex_path):
+            tex_path.with_suffix(".pdf").write_bytes(b"%PDF built")
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        with mock.patch.object(cv, "find_tectonic", return_value="tectonic"), \
+                mock.patch.object(cv, "compile_tex", side_effect=fake_compile), mock.patch.object(cv, "pdf_pages", return_value=1):
+            cv.recompile(None)
+        row = self.rows()[0]
+        self.assertEqual((row["pdf"], json.loads(row["warnings"])), (1, []))
+        self.assertEqual(self.archived(1, "pdf").read_bytes(), b"%PDF built")
+        self.assertEqual(stat.S_IMODE(self.archived(1, "pdf").stat().st_mode), 0o600)
+        self.assertEqual(self.db.execute("SELECT pdf FROM tailor_jobs WHERE job_id = ?", (self.job,)).fetchone()[0], 1)
 
 
 if __name__ == "__main__":

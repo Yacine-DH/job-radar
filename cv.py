@@ -220,6 +220,14 @@ def _wrapper_meta(tex_path: Path) -> tuple[str | None, str | None]:
     return (m.group(1), m.group(2)) if m else (None, None)
 
 
+def _private_copy(src: Path, dst: Path) -> None:
+    """Copy through a 0600 temp file and os.replace, so a reader never sees a half-written file."""
+    tmp = dst.with_name(dst.name + ".tmp")
+    shutil.copyfile(src, tmp)
+    tmp.chmod(0o600)
+    os.replace(tmp, dst)
+
+
 def snapshot_version(db: sqlite3.Connection, job_id: str, role: str | None = None, lang: str | None = None,
                      warnings: list | None = None, created: str | None = None) -> int | None:
     """Archive the current resume files as the next numbered version and record it; keeps the last KEEP_VERSIONS."""
@@ -227,26 +235,33 @@ def snapshot_version(db: sqlite3.Connection, job_id: str, role: str | None = Non
     cur_tex = radar.TAILORED_DIR / f"{token}.tex"
     if not cur_tex.exists():
         return None
-    n = db.execute("SELECT COALESCE(MAX(n), 0) + 1 FROM resume_versions WHERE job_id = ?", (job_id,)).fetchone()[0]
-    for ext in ("tex", "pdf"):
-        src = radar.TAILORED_DIR / f"{token}.{ext}"
-        if src.exists():
-            dst = radar.version_path(token, n, ext)
-            shutil.copy2(src, dst)
-            dst.chmod(0o600)
     if role is None or lang is None:
         r2, l2 = _wrapper_meta(cur_tex)
         role, lang = role or r2, lang or l2
-    db.execute("INSERT INTO resume_versions (job_id, n, created, role, lang, pdf, warnings) "
-               "VALUES (?, ?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?)",
-               (job_id, n, created, role, lang, int((radar.TAILORED_DIR / f"{token}.pdf").exists()),
-                json.dumps(warnings or [], ensure_ascii=False)))
-    for (old,) in db.execute("SELECT n FROM resume_versions WHERE job_id = ? ORDER BY n DESC LIMIT -1 OFFSET ?",
-                             (job_id, radar.KEEP_VERSIONS)).fetchall():
-        for ext in ("tex", "pdf"):
-            radar.version_path(token, old, ext).unlink(missing_ok=True)
-        db.execute("DELETE FROM resume_versions WHERE job_id = ? AND n = ?", (job_id, old))
+    # The number is chosen inside one INSERT, so a worker and a CLI run cannot pick the same one.
+    cur = db.execute(
+        "INSERT INTO resume_versions (job_id, n, created, role, lang, pdf, warnings) "
+        "SELECT ?, COALESCE(MAX(n), 0) + 1, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, 0, ? FROM resume_versions WHERE job_id = ?",
+        (job_id, created, role, lang, json.dumps(warnings or [], ensure_ascii=False), job_id))
+    n = db.execute("SELECT n FROM resume_versions WHERE rowid = ?", (cur.lastrowid,)).fetchone()[0]
+    has_pdf = False
+    for ext in ("tex", "pdf"):
+        src, dst = radar.TAILORED_DIR / f"{token}.{ext}", radar.version_path(token, n, ext)
+        if src.exists():
+            _private_copy(src, dst)
+            has_pdf = has_pdf or ext == "pdf"
+        else:
+            dst.unlink(missing_ok=True)  # stale leftover of an aborted run
+    db.execute("UPDATE resume_versions SET pdf = ? WHERE job_id = ? AND n = ?", (int(has_pdf), job_id, n))
+    # Retention: delete the rows and commit first, then the files, so a failed commit never strands rows without files.
+    old = [r[0] for r in db.execute("SELECT n FROM resume_versions WHERE job_id = ? ORDER BY n DESC LIMIT -1 OFFSET ?",
+                                    (job_id, radar.KEEP_VERSIONS))]
+    for o in old:
+        db.execute("DELETE FROM resume_versions WHERE job_id = ? AND n = ?", (job_id, o))
     db.commit()
+    for o in old:
+        for ext in ("tex", "pdf"):
+            radar.version_path(token, o, ext).unlink(missing_ok=True)
     return n
 
 
@@ -372,6 +387,13 @@ def recompile(ref: str | None) -> int:
     if not exe:
         sys.exit("tectonic not found (PATH or ~/.local/bin/tectonic)")
     db = radar.open_db()
+    try:
+        return _recompile(db, exe, ref)
+    finally:
+        db.close()
+
+
+def _recompile(db: sqlite3.Connection, exe: str, ref: str | None) -> int:
     if ref:
         job_ids = [_find_job(db, ref)["id"]]
     else:
@@ -399,9 +421,12 @@ def recompile(ref: str | None) -> int:
         db.execute("UPDATE tailor_jobs SET pdf = 1, warnings = ? WHERE job_id = ?",
                    (json.dumps(warnings, ensure_ascii=False), jid))
         latest = db.execute("SELECT MAX(n) FROM resume_versions WHERE job_id = ?", (jid,)).fetchone()[0]
-        if latest:  # the newest archived version gets its PDF too
-            shutil.copy2(pdf, radar.version_path(radar.file_token(jid), latest, "pdf"))
-            db.execute("UPDATE resume_versions SET pdf = 1 WHERE job_id = ? AND n = ?", (jid, latest))
+        if latest:  # keep the newest archived version in step with the current files (tex, pdf and warnings)
+            token = radar.file_token(jid)
+            _private_copy(tex, radar.version_path(token, latest, "tex"))
+            _private_copy(pdf, radar.version_path(token, latest, "pdf"))
+            db.execute("UPDATE resume_versions SET pdf = 1, warnings = ? WHERE job_id = ? AND n = ?",
+                       (json.dumps(warnings, ensure_ascii=False), jid, latest))
         db.commit()
         print(f"{jid}: PDF built ({pages} page{'s' if pages != 1 else ''}){' with warnings' if warnings else ''}")
     return 0
