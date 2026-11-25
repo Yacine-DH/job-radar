@@ -449,6 +449,8 @@ def delete_versions(db: sqlite3.Connection, job_id: str, n: int | list[int] | No
         if all_older:
             targets = [r["n"] for r in rows[1:] if not r["keep"]]
         else:
+            if isinstance(n, bool) or (isinstance(n, (list, tuple, set)) and any(isinstance(x, bool) for x in n)):
+                raise ValueError("version numbers must be integers")     # True == 1 would silently select version 1
             wanted = [n] if isinstance(n, int) else sorted(set(n or []), reverse=True)
             if not wanted:
                 raise ValueError("nothing selected")

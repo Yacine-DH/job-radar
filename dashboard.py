@@ -210,8 +210,8 @@ async def _delete_resume_versions(body: DeleteVersions, request: Request):
     origin = request.headers.get("origin")
     if origin and urlsplit(origin).netloc.lower() not in allowed_hosts():
         return JSONResponse({"error": "bad origin"}, status_code=403)
-    if body.n is None and not body.ns and not body.all_older:
-        return JSONResponse({"error": "give a version number, a list of them, or all_older"}, status_code=422)
+    if sum((body.n is not None, bool(body.ns), body.all_older)) != 1:
+        return JSONResponse({"error": "give exactly one of: n, ns, all_older"}, status_code=422)
     with db() as con:
         try:
             deleted = cv.delete_versions(con, body.id, body.ns or body.n, body.all_older)
@@ -629,6 +629,7 @@ def render_history(r, versions: list, state: str | None) -> str:
         dele = (f'<button type="button" class="lnk del" data-act="resume-delete" data-n="{n}" data-pinned="{int(bool(v["keep"]))}" '
                 f'data-cur="{int(n == latest)}" data-prev="{int(len(versions) > 1)}" aria-label="Delete version {n}">Delete</button>')
         pinb = (f'<button type="button" class="lnk muted" data-act="resume-pin" data-n="{n}" data-pinned="{int(bool(v["keep"]))}" '
+                f'data-label="{e(label, quote=True)}" '
                 f'aria-label="{"Unpin" if v["keep"] else "Pin"} version {n}">{"Unpin" if v["keep"] else "Pin"}</button>')
         sel = f'<input type="checkbox" class="vsel" data-n="{n}" aria-label="Select version {n}">'
         items.append(f'<li>{sel}<span class="vn">v{n}</span><span class="muted vm">{e(meta)}</span>{pin}{cur}'
@@ -1079,11 +1080,14 @@ document.addEventListener('click',e=>{
     else if(a.dataset.act==='edit-version'&&c){const box=$('.regen',c);if(box){box.open=true;$('[data-f=base]',box).value=a.dataset.n;$('[data-f=notes]',box).focus();}}
     else if(a.dataset.act==='resume-delete'&&c){const d=a.dataset;
       deleteVersions(c,{n:+d.n},'Delete version v'+d.n+(d.pinned==='1'?' (pinned: you labelled it to keep it)':'')+(d.cur==='1'?(d.prev==='1'?', your CURRENT resume? The previous version becomes current':', your only resume? The resume for this job will be removed'):'? ')+'. This cannot be undone.');}
-    else if(a.dataset.act==='resume-pin'&&c)pinVersion(c,+a.dataset.n,a.dataset.pinned!=='1');
+    else if(a.dataset.act==='resume-pin'&&c){
+      if(a.dataset.pinned==='1'&&a.dataset.label&&!confirm('Unpin v'+a.dataset.n+'? Its label "'+a.dataset.label+'" will be removed too, and the automatic clean-up may delete this version later.'))return;
+      pinVersion(c,+a.dataset.n,a.dataset.pinned!=='1');}
     else if(a.dataset.act==='resume-delete-selected'&&c){
       const ns=$$('input.vsel:checked',c).map(i=>+i.dataset.n);if(!ns.length)return;
       const pinned=ns.some(n=>$('.hist [data-act=resume-delete][data-n="'+n+'"]',c).dataset.pinned==='1');
-      deleteVersions(c,{ns},'Delete '+ns.length+' version'+(ns.length>1?'s':'')+' ('+ns.map(n=>'v'+n).join(', ')+')'+(pinned?', including pinned ones':'')+'? If the current resume is among them, the newest remaining version becomes current. This cannot be undone.');}
+      const every=ns.length===$$('input.vsel',c).length;
+      deleteVersions(c,{ns},'Delete '+(every?'ALL '+ns.length+' versions':ns.length+' version'+(ns.length>1?'s':'')+' ('+ns.map(n=>'v'+n).join(', ')+')')+(pinned?', including pinned ones':'')+'? '+(every?'No version will remain: the resume for this job will be removed.':'If the current resume is among them, the newest remaining version becomes current.')+' This cannot be undone.');}
     else if(a.dataset.act==='resume-delete-older'&&c)deleteVersions(c,{all_older:true},'Delete all older versions except the newest and the pinned ones? This cannot be undone.');
     else if(a.dataset.act==='undo')doUndo();
     else if(a.dataset.act==='view'){showView(a.dataset.view);toast.hidden=true;}

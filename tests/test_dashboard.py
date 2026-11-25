@@ -394,6 +394,11 @@ class HistorySelectionTests(unittest.TestCase):
         self.assertIn('aria-label="Pin version 2"', h2)
         self.assertNotIn("tag keep", h2)
 
+    def test_the_pin_button_carries_the_escaped_label_for_the_unpin_warning(self):
+        h = self.html([self.v(2), self.v(1, 'fin"al <b>', 1)])
+        self.assertIn('data-act="resume-pin" data-n="1" data-pinned="1" data-label="fin&quot;al &lt;b&gt;"', h)
+        self.assertIn('data-act="resume-pin" data-n="2" data-pinned="0" data-label=""', h)
+
     def test_the_script_keeps_open_panels_selection_and_form_text_across_refreshes(self):
         import inspect
         src = inspect.getsource(d)
@@ -501,6 +506,38 @@ class RouteTests(unittest.TestCase):
         for bad in ([0], [2**40], list(range(1, 52))):
             with self.assertRaises(ValidationError, msg=bad[:2]):
                 d.DeleteVersions(id="t:1", ns=bad)
+
+    def test_exactly_one_deletion_mode_per_request(self):
+        for body in (d.DeleteVersions(id="t:1", ns=[2], all_older=True), d.DeleteVersions(id="t:1", n=1, ns=[2]),
+                     d.DeleteVersions(id="t:1", n=1, all_older=True), d.DeleteVersions(id="t:1")):
+            self.assertEqual(self.call(d.delete_resume_versions, body)[0], 422, body)
+        con = sqlite3.connect(radar.DB_PATH)
+        try:
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM resume_versions").fetchone()[0], 2)
+        finally:
+            con.close()
+
+    def test_unpin_through_the_route_clears_keep_and_label_and_a_locked_database_is_a_503(self):
+        from unittest import mock
+        con = sqlite3.connect(radar.DB_PATH)
+        con.execute("UPDATE resume_versions SET keep = 1, label = 'final' WHERE n = 1")
+        con.commit()
+        con.close()
+        self.assertEqual(self.call(d.pin_resume_version, d.PinVersion(id="t:1", n=1, pinned=False)), (200, {"pinned": False}))
+        con = sqlite3.connect(radar.DB_PATH)
+        try:
+            self.assertEqual(tuple(con.execute("SELECT keep, label FROM resume_versions WHERE n = 1").fetchone()), (0, None))
+        finally:
+            con.close()
+        with mock.patch.object(d.cv, "set_pin", side_effect=sqlite3.OperationalError("database is locked")):
+            self.assertEqual(self.call(d.pin_resume_version, d.PinVersion(id="t:1", n=1, pinned=True))[0], 503)
+
+    def test_the_script_warns_before_an_unpin_removes_a_label_and_before_deleting_everything(self):
+        import inspect
+        src = inspect.getsource(d)
+        self.assertIn("will be removed too", src)
+        self.assertIn("No version will remain", src)
+        self.assertIn("ns.length===$$('input.vsel',c).length", src)
 
     def test_pin_route(self):
         self.assertEqual(self.call(d.pin_resume_version, d.PinVersion(id="t:1", n=1, pinned=True)), (200, {"pinned": True}))
