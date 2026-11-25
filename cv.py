@@ -419,10 +419,20 @@ def _stage_copy(src: Path, directory: Path) -> Path:
     return Path(tmp)
 
 
-def delete_versions(db: sqlite3.Connection, job_id: str, n: int | None = None, all_older: bool = False) -> list[int]:
-    """Delete archived versions; `all_older` skips the newest and pinned (labelled) versions. Deleting the newest
-    version (the current resume) makes the previous one current again, or, if it was the only one, removes the resume
-    and resets the job's tailor state. Refused while a resume is queued or being generated for the job.
+def set_pin(db: sqlite3.Connection, job_id: str, n: int, pinned: bool) -> None:
+    """Pin a version (retention never deletes it) or unpin it; unpinning also clears its label, since a label always pins."""
+    cur = db.execute("UPDATE resume_versions SET keep = ?, label = CASE WHEN ? THEN label ELSE NULL END WHERE job_id = ? AND n = ?",
+                     (int(pinned), int(pinned), job_id, n))
+    if not cur.rowcount:
+        db.rollback()
+        raise ValueError(f"version {n} does not exist")
+    db.commit()
+
+
+def delete_versions(db: sqlite3.Connection, job_id: str, n: int | list[int] | None = None, all_older: bool = False) -> list[int]:
+    """Delete archived versions: one number, a list of numbers, or `all_older` (skips the newest and pinned ones).
+    Deleting the newest version (the current resume) makes the newest REMAINING version current, or, if none remains,
+    removes the resume and resets the job's tailor state. Refused while a resume is queued or being generated for the job.
     One write transaction (BEGIN IMMEDIATE) checks and changes the rows, so a worker, the dashboard and the CLI
     serialize; files follow the commit: the promoted version is copied over the current names (atomic replace) and
     only then are the deleted archive files removed."""
@@ -439,13 +449,18 @@ def delete_versions(db: sqlite3.Connection, job_id: str, n: int | None = None, a
         if all_older:
             targets = [r["n"] for r in rows[1:] if not r["keep"]]
         else:
-            if n not in {r["n"] for r in rows}:
-                raise ValueError(f"version {n} does not exist")
-            targets = [n]
+            wanted = [n] if isinstance(n, int) else sorted(set(n or []), reverse=True)
+            if not wanted:
+                raise ValueError("nothing selected")
+            missing = [w for w in wanted if w not in {r["n"] for r in rows}]
+            if missing:
+                raise ValueError("version " + ", ".join(map(str, missing)) + " does not exist")
+            targets = wanted
         token = radar.file_token(job_id)
         promote = None  # (previous version row, its files) when the current resume is being deleted
-        if newest in targets and len(rows) > 1:
-            prev = rows[1]
+        remaining = [r for r in rows if r["n"] not in targets]  # newest first
+        if newest in targets and remaining:
+            prev = remaining[0]
             src_tex, src_pdf = radar.version_path(token, prev["n"], "tex"), radar.version_path(token, prev["n"], "pdf")
             if not src_tex.exists():
                 raise ValueError(f"version {prev['n']} has no files any more, so it cannot become current")

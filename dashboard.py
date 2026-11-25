@@ -15,6 +15,7 @@ import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Annotated
 from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo
 
@@ -180,10 +181,20 @@ async def _request_tailor(body: TailorRequest, request: Request):
     return {"state": "queued"}
 
 
+VersionNo = Annotated[int, Field(ge=1, le=2**31 - 1)]
+
+
 class DeleteVersions(BaseModel):
     id: str
-    n: int | None = Field(default=None, ge=1, le=2**31 - 1)
+    n: VersionNo | None = None
+    ns: list[VersionNo] | None = Field(default=None, max_length=50)  # several versions at once
     all_older: bool = False
+
+
+class PinVersion(BaseModel):
+    id: str
+    n: VersionNo
+    pinned: bool
 
 
 @app.post("/api/resume/delete")
@@ -199,14 +210,29 @@ async def _delete_resume_versions(body: DeleteVersions, request: Request):
     origin = request.headers.get("origin")
     if origin and urlsplit(origin).netloc.lower() not in allowed_hosts():
         return JSONResponse({"error": "bad origin"}, status_code=403)
-    if body.n is None and not body.all_older:
-        return JSONResponse({"error": "give a version number or all_older"}, status_code=422)
+    if body.n is None and not body.ns and not body.all_older:
+        return JSONResponse({"error": "give a version number, a list of them, or all_older"}, status_code=422)
     with db() as con:
         try:
-            deleted = cv.delete_versions(con, body.id, body.n, body.all_older)
+            deleted = cv.delete_versions(con, body.id, body.ns or body.n, body.all_older)
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=409)
     return {"deleted": deleted}
+
+
+@app.post("/api/resume/pin")
+async def pin_resume_version(body: PinVersion, request: Request):
+    origin = request.headers.get("origin")
+    if origin and urlsplit(origin).netloc.lower() not in allowed_hosts():
+        return JSONResponse({"error": "bad origin"}, status_code=403)
+    try:
+        with db() as con:
+            cv.set_pin(con, body.id, body.n, body.pinned)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+    except sqlite3.OperationalError as exc:
+        return busy(exc)
+    return {"pinned": body.pinned}
 
 
 @app.get("/api/tailor/status")
@@ -595,21 +621,26 @@ def render_history(r, versions: list, state: str | None) -> str:
         tags = " · ".join(x for x in (str(v["lang"] or "").upper(), v["role"] or "") if x)
         meta = " · ".join(x for x in (when, tags) if x)
         label = str(v["label"] or "").strip()
-        pin = f' <span class="tag keep">{e(label)}</span>' if label else ""
+        pin = f' <span class="tag keep">{e(label or "pinned")}</span>' if v["keep"] else ""
         cur = ' <span class="tag nice">current</span>' if n == latest and state == "done" else ""
         links = (f'<a href="/files/{token}.v{n}.pdf" download aria-label="Download version {n} as PDF">PDF</a>' if v["pdf"] else "") + \
                 f'<a href="/files/{token}.v{n}.tex" download aria-label="Download version {n} LaTeX source">.tex</a>'
         edit = f'<button type="button" class="lnk muted" data-act="edit-version" data-n="{n}" aria-label="Edit version {n}">Edit…</button>'
         dele = (f'<button type="button" class="lnk del" data-act="resume-delete" data-n="{n}" data-pinned="{int(bool(v["keep"]))}" '
                 f'data-cur="{int(n == latest)}" data-prev="{int(len(versions) > 1)}" aria-label="Delete version {n}">Delete</button>')
-        items.append(f'<li><span class="vn">v{n}</span><span class="muted vm">{e(meta)}</span>{pin}{cur}'
-                     f'<span class="vl">{edit}{links}{dele}</span></li>')
+        pinb = (f'<button type="button" class="lnk muted" data-act="resume-pin" data-n="{n}" data-pinned="{int(bool(v["keep"]))}" '
+                f'aria-label="{"Unpin" if v["keep"] else "Pin"} version {n}">{"Unpin" if v["keep"] else "Pin"}</button>')
+        sel = f'<input type="checkbox" class="vsel" data-n="{n}" aria-label="Select version {n}">'
+        items.append(f'<li>{sel}<span class="vn">v{n}</span><span class="muted vm">{e(meta)}</span>{pin}{cur}'
+                     f'<span class="vl">{edit}{links}{pinb}{dele}</span></li>')
     older = ""
     if any(int(v["n"]) != latest and not v["keep"] for v in versions):
         older = ('<button type="button" class="lnk del" data-act="resume-delete-older">Delete all older versions '
                  '<span class="muted">(keeps the newest and pinned ones)</span></button>')
+    bulk = ('<div class="vbulk"><label class="vall"><input type="checkbox" data-act="select-all" aria-label="Select all versions"> Select all</label>'
+            '<button type="button" class="lnk del" data-act="resume-delete-selected" disabled>Delete selected (0)</button></div>')
     return (f'<details class="hist"><summary>{icon("chevron", 14, 2.4)}History ({len(versions)})</summary>'
-            f'<ul>{"".join(items)}</ul>{older}</details>')
+            f'{bulk}<ul>{"".join(items)}</ul>{older}</details>')
 
 
 def render_regen(r, versions: list | None) -> str:
@@ -824,6 +855,10 @@ main{padding:8px 16px 24px;display:flex;flex-direction:column;gap:12px}
 .hist .vl a{display:inline-flex;align-items:center;min-height:40px;padding:0 8px}
 .hist .vl .lnk{padding:0 8px;font-size:13px}.hist .del,.lnk.del{color:var(--danger)}.hist>.lnk.del{margin-top:4px}
 .tag.keep{background:var(--accent-tint);color:var(--accent-fg)}
+.vbulk{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:40px;border-top:1px solid var(--line)}
+.vall{display:inline-flex;align-items:center;gap:8px;font-size:13px;color:var(--muted);min-height:40px;cursor:pointer}
+.vbulk .lnk[disabled]{opacity:.4;cursor:not-allowed}
+.hist input[type=checkbox]{width:18px;height:18px;margin:0 6px 0 0;accent-color:var(--accent-solid);flex-shrink:0}
 .fit summary .gapcount{margin-left:8px;white-space:nowrap;flex-shrink:0;font-size:12px;font-weight:600;border-radius:999px;padding:1px 8px;background:var(--gap-tint);color:var(--gap-fg);border:1px solid var(--gap-line)}
 .md .lead{margin:0 0 6px;font-size:13px;color:var(--muted)}
 .fitsec h4{display:flex;align-items:center;gap:6px}.fitsec.gaps h4{color:var(--gap-fg)}
@@ -981,7 +1016,15 @@ async function refreshTailor(c){
   try{
     const r=await fetch('/api/tailor/fragment?id='+encodeURIComponent(c.dataset.id));if(!r.ok)return;
     const t=document.createElement('div');t.innerHTML=await r.text();const n=t.firstElementChild,old=$('.tailor',c);
-    if(n&&old)old.replaceWith(n);
+    if(!n||!old)return;
+    // keep what the user had open or typed: panels, ticked versions, the Regenerate form
+    const open=$$('details[open]',old).map(d=>d.classList[0]),ticked=$$('input.vsel:checked',old).map(i=>i.dataset.n);
+    const form={};$$('.regenform [data-f]',old).forEach(f=>{form[f.dataset.f]=f.value;});
+    old.replaceWith(n);
+    open.forEach(k=>{const d=$('details.'+k,n);if(d)d.open=true;});
+    ticked.forEach(v=>{const i=$('input.vsel[data-n="'+v+'"]',n);if(i)i.checked=true;});
+    $$('.regenform [data-f]',n).forEach(f=>{if(form[f.dataset.f]!==undefined&&(f.tagName!=='SELECT'||[...f.options].some(o=>o.value===form[f.dataset.f])))f.value=form[f.dataset.f];});
+    syncSel(n);
   }catch(e){}
 }
 async function startTailor(c,opts){
@@ -1000,11 +1043,29 @@ async function deleteVersions(c,payload,msg){
     say(j.deleted.length?('Deleted '+j.deleted.map(n=>'v'+n).join(', ')):'Nothing to delete');await refreshTailor(c);
   }catch(err){say('Could not delete: '+err.message);}
 }
+function syncSel(scope){
+  const h=$('.hist',scope);if(!h)return;
+  const boxes=$$('input.vsel',h),n=boxes.filter(b=>b.checked).length,b=$('[data-act=resume-delete-selected]',h),all=$('[data-act=select-all]',h);
+  if(b){b.textContent='Delete selected ('+n+')';b.disabled=n===0;}
+  if(all){all.checked=n>0&&n===boxes.length;all.indeterminate=n>0&&n<boxes.length;}
+}
+async function pinVersion(c,n,pinned){
+  try{
+    const r=await fetch('/api/resume/pin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:c.dataset.id,n,pinned})});
+    const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||r.status);
+    say('v'+n+(pinned?' pinned':' unpinned'));await refreshTailor(c);
+  }catch(err){say('Could not change the pin: '+err.message);}
+}
 function setKb(c){if(cur)cur.classList.remove('kb');cur=c;if(c){c.classList.add('kb');c.scrollIntoView({block:'nearest'});}}
 function move(d){
   const vis=cards().filter(c=>!c.hidden);if(!vis.length)return;
   let i=vis.indexOf(cur);i=i<0?(d>0?0:vis.length-1):Math.max(0,Math.min(vis.length-1,i+d));setKb(vis[i]);
 }
+document.addEventListener('change',e=>{
+  const t=e.target,c=t.closest&&t.closest('.card');if(!c)return;
+  if(t.matches('[data-act=select-all]'))$$('input.vsel',c).forEach(i=>{i.checked=t.checked;});
+  if(t.matches('input.vsel, [data-act=select-all]'))syncSel(c);
+});
 document.addEventListener('click',e=>{
   const t=e.target;
   const sb=t.closest('.seg button');if(sb){setStatus(sb.closest('.card'),sb.dataset.s,false);return;}
@@ -1018,6 +1079,11 @@ document.addEventListener('click',e=>{
     else if(a.dataset.act==='edit-version'&&c){const box=$('.regen',c);if(box){box.open=true;$('[data-f=base]',box).value=a.dataset.n;$('[data-f=notes]',box).focus();}}
     else if(a.dataset.act==='resume-delete'&&c){const d=a.dataset;
       deleteVersions(c,{n:+d.n},'Delete version v'+d.n+(d.pinned==='1'?' (pinned: you labelled it to keep it)':'')+(d.cur==='1'?(d.prev==='1'?', your CURRENT resume? The previous version becomes current':', your only resume? The resume for this job will be removed'):'? ')+'. This cannot be undone.');}
+    else if(a.dataset.act==='resume-pin'&&c)pinVersion(c,+a.dataset.n,a.dataset.pinned!=='1');
+    else if(a.dataset.act==='resume-delete-selected'&&c){
+      const ns=$$('input.vsel:checked',c).map(i=>+i.dataset.n);if(!ns.length)return;
+      const pinned=ns.some(n=>$('.hist [data-act=resume-delete][data-n="'+n+'"]',c).dataset.pinned==='1');
+      deleteVersions(c,{ns},'Delete '+ns.length+' version'+(ns.length>1?'s':'')+' ('+ns.map(n=>'v'+n).join(', ')+')'+(pinned?', including pinned ones':'')+'? If the current resume is among them, the newest remaining version becomes current. This cannot be undone.');}
     else if(a.dataset.act==='resume-delete-older'&&c)deleteVersions(c,{all_older:true},'Delete all older versions except the newest and the pinned ones? This cannot be undone.');
     else if(a.dataset.act==='undo')doUndo();
     else if(a.dataset.act==='view'){showView(a.dataset.view);toast.hidden=true;}
