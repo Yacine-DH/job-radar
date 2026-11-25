@@ -411,7 +411,7 @@ def md_blocks(lines: list[str]) -> str:
 
 SEVERITY_RE = re.compile(r"\(\s*(critical|important|nice[- ]to[- ]have|minor)\b([^)]*)\)", re.I)
 HOURS_RE = re.compile(r"\bAbout\s+(\d+(?:\s*[\u2013-]\s*\d+)?)\s*h\b\.?", re.I)
-ABBREV_RE = re.compile(r"(?:^|[\s(/])(?:e\.g|i\.e|vs|etc|d\.h|ca|approx|incl|bzw|inkl|usw|z\.\s?b)$", re.I)
+ABBREV_RE = re.compile(r"(?:^|[\s(/])(?:e\.\s?g|i\.\s?e|vs|etc|d\.\s?h|ca|approx|incl|bzw|inkl|usw|z\.\s?b)$", re.I)
 
 
 def first_sentence_end(text: str) -> int:
@@ -423,7 +423,8 @@ def first_sentence_end(text: str) -> int:
         elif ch == ")":
             depth = max(0, depth - 1)
         elif ch == "." and depth == 0 and text[i + 1:i + 2] == " " and text[:i].count("**") % 2 == 0:
-            if not ABBREV_RE.search(text[:i]) and not re.match(r"[A-Za-z]\.", text[i + 2:]):  # "z. B." / "e. g." initials
+            initials = re.search(r"(?:^|[\s(/])[A-Za-z]$", text[:i]) and re.match(r"[A-Za-z]\.(?![A-Za-z])", text[i + 2:])  # "z. B."
+            if not ABBREV_RE.search(text[:i]) and not initials:
                 return i
     return -1
 

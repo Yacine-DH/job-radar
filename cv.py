@@ -450,7 +450,9 @@ def delete_versions(db: sqlite3.Connection, job_id: str, n: int | None = None, a
             if not src_tex.exists():
                 raise ValueError(f"version {prev['n']} has no files any more, so it cannot become current")
             promote = (src_tex, src_pdf if src_pdf.exists() else None)
-            staged = [_stage_copy(src, radar.TAILORED_DIR) for src in promote if src]  # may fail: nothing has changed yet
+            for src in promote:  # may fail: nothing has changed yet, and already staged copies are removed below
+                if src:
+                    staged.append(_stage_copy(src, radar.TAILORED_DIR))
             db.execute("UPDATE tailor_jobs SET state = 'done', error = NULL, finished = ?, pdf = ?, warnings = ? WHERE job_id = ?",
                        (prev["created"], int(promote[1] is not None), prev["warnings"], job_id))
         elif newest in targets:  # the only version: the resume and the job's tailor state go away

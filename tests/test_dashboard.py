@@ -582,6 +582,15 @@ Hello <b>there</b>.
         self.assertEqual(d.split_gap("Worked with CSVs. Need Parquet.")[1], "Worked with CSVs")
         self.assertEqual(d.split_gap("No production experience with C. Add a systems project.")[1], "No production experience with C")
 
+    def test_a_real_sentence_end_before_a_capitalized_abbreviation_still_splits(self):
+        self.assertEqual(d.split_gap("Missing backend experience. E.g. FastAPI or Django.")[1:],
+                         ("Missing backend experience", "E.g. FastAPI or Django."))
+        self.assertEqual(d.split_gap("Requires work permit. U.S. citizens only.")[1], "Requires work permit")
+
+    def test_spaced_dotted_abbreviations_do_not_split(self):
+        self.assertEqual(d.split_gap("Cloud tools e. g. Terraform. Nice to have.")[1], "Cloud tools e. g. Terraform")
+        self.assertEqual(d.split_gap("Backend d. h. FastAPI. Nice to have.")[1], "Backend d. h. FastAPI")
+
     def test_empty_parentheses_in_code_survive_and_only_the_wrapping_ones_go(self):
         h = d.render_learn_block(["1. **Async**: practice asyncio.run() and main(). About 3 h."])
         self.assertIn("asyncio.run() and main()", h)

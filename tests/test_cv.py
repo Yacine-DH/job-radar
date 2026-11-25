@@ -488,6 +488,24 @@ class VersionHistoryTests(unittest.TestCase):
         self.assertEqual((radar.TAILORED_DIR / f"{self.token}.tex").read_text(), "text 2")
         self.assertFalse(self.db.in_transaction)
 
+    def test_a_failure_staging_the_second_file_removes_the_first_staged_copy(self):
+        self.make(2)
+        real = cv._stage_copy
+        calls = []
+
+        def flaky(src, directory):
+            calls.append(src)
+            if len(calls) == 2:
+                raise OSError("disk full")
+            return real(src, directory)
+
+        with mock.patch.object(cv, "_stage_copy", flaky):
+            with self.assertRaises(OSError):
+                cv.delete_versions(self.db, self.job, 2)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([p.name for p in radar.TAILORED_DIR.glob(".stage.*")], [])
+        self.assertEqual([r["n"] for r in self.rows()], [1, 2])
+
     def test_staged_files_are_private_and_gone_after_a_successful_promotion(self):
         self.make(2)
         cv.delete_versions(self.db, self.job, 2)
