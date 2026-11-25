@@ -319,6 +319,23 @@ def job_gaps(r) -> list[str]:
         return []
 
 
+SEARCH_DESC_CHARS = 1500  # keeps data-q (one per card) from bloating the page
+
+
+def search_haystack(r) -> str:
+    """Lowercase text the search box matches against: the job's own content only, never the UI labels. Used for the
+    server-side fallback and rendered as data-q on each card, so both sides give the same answer."""
+    parts = [str(r[k] or "") for k in ("title", "company", "location")]
+    parts.append(str(r["description"] or "")[:SEARCH_DESC_CHARS])
+    parts += [str(r["reason"] or ""), str(r["cv_track"] or "")] + job_gaps(r)
+    return " ".join(" ".join(parts).lower().split())
+
+
+def search_matches(haystack: str, query: str) -> bool:
+    """Every whitespace-separated term of the query must occur (AND); an empty query matches everything."""
+    return all(term in haystack for term in query.lower().split())
+
+
 # Inline icons (stroke = currentColor, so CSS colours them).
 ICONS = {
     "radar": '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><path d="M12 12l6-6"/>',
@@ -719,7 +736,7 @@ def render_card(r, hidden: bool = False, versions: list | None = None) -> str:
     title = r["title"] or ""
     return f"""<article class="card" data-id="{e(r['id'], quote=True)}" data-score="{'' if score is None else score}" \
 data-source="{e(r['source'] or '', quote=True)}" data-status="{e(r['status'], quote=True)}"{' data-old="1"' if is_archived(r) else ''} \
-data-first="{e(r['first_seen'] or '', quote=True)}"{' hidden' if hidden else ''}>
+data-first="{e(r['first_seen'] or '', quote=True)}" data-q="{e(search_haystack(r), quote=True)}"{' hidden' if hidden else ''}>
   <div class="head">{badge}<div class="ttl"><a class="title" href="{e(safe_url(r['url']), quote=True)}" target="_blank" rel="noopener noreferrer">{e(title)}</a>{'<span class="pill">NEW</span>' if fresh else ''}<span class="co">{e(r['company'] or '')}</span></div></div>
   <div class="rest">
     <div class="meta">{where}<span>{e(r['source'] or '')}</span><span>{e(fmt_day(r['first_seen']))}</span></div>
@@ -920,7 +937,7 @@ const row=c=>{const n=c.nextElementSibling;return n&&n.classList.contains('colla
 function matches(c,f){
   const sc=c.dataset.score===''?0:+c.dataset.score;
   return sc>=f.min&&(f.source==='all'||c.dataset.source===f.source)&&okStatus(c.dataset.status,f.status,c.dataset.old==='1')&&
-    (!f.q||c.textContent.toLowerCase().includes(f.q));
+    f.q.split(/\s+/).filter(Boolean).every(t=>(c.dataset.q||'').includes(t));
 }
 const filt=()=>({min:+ctl.min.value,source:ctl.source.value,status:ctl.status.value,q:ctl.q.value.trim().toLowerCase(),sort:ctl.sort.value});
 function sortCards(mode){
@@ -1115,12 +1132,11 @@ def index(request: Request, min_score: int = Query(0, ge=0, le=100), source: str
     status = status if status in VIEWS else "open"
     sort = sort if sort in SORTS else "score"
     q = q.strip()
-    ql = q.lower()
 
     def visible(r) -> bool:
         sc = r["score"] or 0
-        hay = " ".join(str(r[k] or "") for k in ("title", "company", "location", "description", "reason", "cv_track", "gaps")).lower()
-        return sc >= min_score and (source == "all" or r["source"] == source) and status_ok(r["status"], status, r["id"] in old_ids) and (not ql or ql in hay)
+        return (sc >= min_score and (source == "all" or r["source"] == source) and status_ok(r["status"], status, r["id"] in old_ids)
+                and search_matches(search_haystack(r), q))
 
     total = len(live)
     shown = sum(1 for r in rows if visible(r))

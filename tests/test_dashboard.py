@@ -497,6 +497,54 @@ class MigrationTests(unittest.TestCase):
             db.close()
 
 
+class SearchTests(unittest.TestCase):
+    def job(self, **kw):
+        base = dict(id="t:1", title="Werkstudent Python", company="Beispiel GmbH", location="Darmstadt", description="Wir suchen Unterstützung",
+                    reason="Passt gut.", cv_track="swe", gaps='["Docker"]', status="new", score=60, first_seen="2026-01-01 00:00:00")
+        base.update(kw)
+        return Row(**base)
+
+    def test_ui_labels_are_not_searchable_but_real_content_is(self):
+        h = d.search_haystack(self.job())
+        for label in ("applied", "interested", "posting details", "tailor resume", "not relevant"):
+            self.assertFalse(d.search_matches(h, label), label)
+        for word in ("python", "beispiel", "darmstadt", "docker", "passt gut", "swe"):
+            self.assertTrue(d.search_matches(h, word), word)
+
+    def test_a_job_whose_content_says_applied_is_found(self):
+        self.assertTrue(d.search_matches(d.search_haystack(self.job(description="Please send your applied research papers")), "applied"))
+
+    def test_every_term_must_match_in_any_order_and_case(self):
+        h = d.search_haystack(self.job())
+        self.assertTrue(d.search_matches(h, "  DOCKER   python "))
+        self.assertFalse(d.search_matches(h, "python kubernetes"))
+        self.assertTrue(d.search_matches(h, ""))
+        self.assertTrue(d.search_matches(h, "   "))
+
+    def test_umlauts_none_fields_and_broken_gaps_are_fine(self):
+        h = d.search_haystack(self.job(description=None, reason=None, cv_track=None, gaps="not json", company="Müller & Söhne AG"))
+        self.assertTrue(d.search_matches(h, "müller söhne"))
+        self.assertTrue(d.search_matches(h, "&"))
+        self.assertIsInstance(d.search_haystack(Row(id="t:2")), str)
+
+    def test_the_description_is_capped(self):
+        long = "x" * (d.SEARCH_DESC_CHARS + 10) + " needle"
+        self.assertFalse(d.search_matches(d.search_haystack(self.job(description=long)), "needle"))
+
+    def test_the_card_carries_the_same_haystack_escaped_and_the_script_uses_it(self):
+        row = self.job(title='A "quoted" <b>title</b>')
+        card = d.render_card(row)
+        import re
+        attr = re.search(r'data-q="([^"]*)"', card).group(1)
+        self.assertEqual(attr, d.e(d.search_haystack(row), quote=True))
+        self.assertIn("&lt;b&gt;title&lt;/b&gt;", attr)      # escaped, so it cannot break out of the attribute
+        self.assertNotIn("<", attr)
+        import inspect
+        src = inspect.getsource(d)
+        self.assertIn("(c.dataset.q||'').includes(t)", src)
+        self.assertNotIn("c.textContent.toLowerCase().includes(f.q)", src)
+
+
 class FitPanelTests(unittest.TestCase):
     MD = """## Verdict
 Good fit.
