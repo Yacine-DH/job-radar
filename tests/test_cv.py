@@ -379,6 +379,57 @@ class VersionHistoryTests(unittest.TestCase):
     def archived(self, n, ext):
         return radar.version_path(self.token, n, ext)
 
+    def make(self, count):
+        for i in range(1, count + 1):
+            self.write_current(f"text {i}")
+            cv.snapshot_version(self.db, self.job, "devops", "de", [])
+
+    def test_delete_removes_rows_and_files_of_one_older_version(self):
+        self.make(3)
+        self.assertEqual(cv.delete_versions(self.db, self.job, 1), [1])
+        self.assertEqual([r["n"] for r in self.rows()], [2, 3])
+        self.assertFalse(self.archived(1, "tex").exists() or self.archived(1, "pdf").exists())
+        self.assertTrue(self.archived(2, "tex").exists())
+
+    def test_the_newest_version_and_unknown_versions_cannot_be_deleted(self):
+        self.make(2)
+        for n in (2, 9):
+            with self.assertRaises(ValueError, msg=n):
+                cv.delete_versions(self.db, self.job, n)
+        self.assertEqual([r["n"] for r in self.rows()], [1, 2])
+
+    def test_delete_with_nothing_archived_is_an_error(self):
+        with self.assertRaises(ValueError):
+            cv.delete_versions(self.db, self.job, all_older=True)
+
+    def test_delete_all_older_keeps_newest_and_pinned(self):
+        self.make(4)
+        cv.set_label(self.db, self.job, 2, "final")
+        self.assertEqual(sorted(cv.delete_versions(self.db, self.job, all_older=True)), [1, 3])
+        self.assertEqual([r["n"] for r in self.rows()], [2, 4])
+        self.assertTrue(self.archived(2, "tex").exists() and not self.archived(3, "tex").exists())
+        self.assertEqual(cv.delete_versions(self.db, self.job, 2), [2])  # a pinned one can still be deleted explicitly
+
+    def test_retention_never_prunes_a_labelled_version(self):
+        old = radar.KEEP_VERSIONS
+        radar.KEEP_VERSIONS = 2
+        try:
+            self.make(1)
+            cv.set_label(self.db, self.job, 1, "final")
+            self.make(4)  # snapshots 2..5
+        finally:
+            radar.KEEP_VERSIONS = old
+        self.assertEqual([r["n"] for r in self.rows()], [1, 4, 5])
+        self.assertTrue(self.archived(1, "tex").exists() and not self.archived(2, "tex").exists())
+
+    def test_labels_are_validated(self):
+        self.make(1)
+        for bad in ("", " x", "a" * 25, "x;y", "x\ny", "../x"):
+            with self.assertRaises(ValueError, msg=bad):
+                cv.set_label(self.db, self.job, 1, bad)
+        cv.set_label(self.db, self.job, 1, "final v2")
+        self.assertEqual(self.rows()[0]["label"], "final v2")
+
     def test_snapshots_are_numbered_and_keep_their_own_content(self):
         self.write_current("first")
         self.assertEqual(cv.snapshot_version(self.db, self.job, "devops", "de", []), 1)

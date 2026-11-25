@@ -25,6 +25,7 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
+import cv
 import radar
 
 PORT = int(os.environ.get("DASHBOARD_PORT", "8090"))
@@ -108,6 +109,9 @@ async def set_status(body: StatusUpdate, request: Request):
 
 class TailorRequest(BaseModel):
     id: str
+    notes: str = ""      # what to change (instructions for this one resume)
+    base: int | None = None  # archived version to edit; None = start from the master CV
+    label: str = ""      # names and pins the resulting version, e.g. "final"
 
 
 MAX_QUEUED = 5
@@ -116,6 +120,20 @@ ROW_SQL = (
     "SELECT jobs.*, t.markdown AS tailoring_md, tj.state AS tj_state, tj.pdf AS tj_pdf, "
     "tj.warnings AS tj_warnings, tj.error AS tj_error, tj.requested AS tj_requested, tj.finished AS tj_finished "
     "FROM jobs LEFT JOIN tailoring t ON t.job_id = jobs.id LEFT JOIN tailor_jobs tj ON tj.job_id = jobs.id")
+
+
+def check_tailor_options(con: sqlite3.Connection, job_id: str, notes: str, base: int | None, label: str) -> str | None:
+    """An error message for unusable regenerate options, or None."""
+    if len(notes) > 2000:
+        return "instructions are too long (max 2000 characters)"
+    if label and not radar.LABEL_RE.match(label):
+        return "label: 1-24 letters, digits, space, dot, dash or underscore"
+    if base is not None:
+        if not notes.strip():
+            return "describe what to change when you edit a version"
+        if con.execute("SELECT 1 FROM resume_versions WHERE job_id = ? AND n = ?", (job_id, base)).fetchone() is None:
+            return f"version {base} does not exist"
+    return None
 
 
 @app.post("/api/tailor")
@@ -133,11 +151,40 @@ async def request_tailor(body: TailorRequest, request: Request):
             return {"state": row["state"]}
         if con.execute("SELECT COUNT(*) FROM tailor_jobs WHERE state IN ('queued','running')").fetchone()[0] >= MAX_QUEUED:
             return JSONResponse({"error": "queue is full, try again in a few minutes"}, status_code=429)
+        problem = check_tailor_options(con, body.id, body.notes, body.base, body.label.strip())
+        if problem:
+            return JSONResponse({"error": problem}, status_code=422)
         con.execute(
-            "INSERT INTO tailor_jobs (job_id, state, requested) VALUES (?, 'queued', CURRENT_TIMESTAMP) "
+            "INSERT INTO tailor_jobs (job_id, state, requested, notes, base_n, label) VALUES (?, 'queued', CURRENT_TIMESTAMP, ?, ?, ?) "
             "ON CONFLICT(job_id) DO UPDATE SET state = 'queued', requested = CURRENT_TIMESTAMP, "
-            "finished = NULL, error = NULL, pdf = 0, warnings = NULL", (body.id,))
+            "finished = NULL, error = NULL, pdf = 0, warnings = NULL, "
+            "notes = excluded.notes, base_n = excluded.base_n, label = excluded.label",
+            (body.id, body.notes.strip() or None, body.base, body.label.strip() or None))
     return {"state": "queued"}
+
+
+class DeleteVersions(BaseModel):
+    id: str
+    n: int | None = None
+    all_older: bool = False
+
+
+@app.post("/api/resume/delete")
+async def delete_resume_versions(body: DeleteVersions, request: Request):
+    """Delete older archived resume versions (never the newest; pinned ones only one by one)."""
+    origin = request.headers.get("origin")
+    if origin and urlsplit(origin).netloc.lower() not in allowed_hosts():
+        return JSONResponse({"error": "bad origin"}, status_code=403)
+    if body.n is None and not body.all_older:
+        return JSONResponse({"error": "give a version number or all_older"}, status_code=422)
+    with db() as con:
+        if con.execute("SELECT 1 FROM tailor_jobs WHERE job_id = ? AND state IN ('queued','running')", (body.id,)).fetchone():
+            return JSONResponse({"error": "a resume is being generated for this job: wait until it is done"}, status_code=409)
+        try:
+            deleted = cv.delete_versions(con, body.id, body.n, body.all_older)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+    return {"deleted": deleted}
 
 
 @app.get("/api/tailor/status")
@@ -369,7 +416,7 @@ def split_warnings(raw: str | None) -> tuple[list[str], list[str], bool]:
 
 def versions_for(con: sqlite3.Connection, ids: list[str] | None = None) -> dict[str, list]:
     """Archived resume versions per job, newest first."""
-    sql = "SELECT job_id, n, created, role, lang, pdf FROM resume_versions"
+    sql = "SELECT job_id, n, created, role, lang, pdf, label, keep FROM resume_versions"
     args: list = []
     if ids is not None:
         if not ids:
@@ -383,7 +430,8 @@ def versions_for(con: sqlite3.Connection, ids: list[str] | None = None) -> dict[
 
 
 def render_history(r, versions: list, state: str | None) -> str:
-    """Collapsed list of earlier resume versions: shown only when there is something older to look at."""
+    """Collapsed list of earlier resume versions: shown only when there is something older to look at.
+    Each older version can be edited (opens the Regenerate panel on it) or deleted; the newest cannot be deleted."""
     if not (len(versions) >= 2 or (state == "failed" and versions)):
         return ""
     token, latest, items = radar.file_token(r["id"]), int(versions[0]["n"]), []
@@ -393,12 +441,40 @@ def render_history(r, versions: list, state: str | None) -> str:
         when = f"{d.day} {d.strftime('%b')}, {d:%H:%M}" if d else ""
         tags = " · ".join(x for x in (str(v["lang"] or "").upper(), v["role"] or "") if x)
         meta = " · ".join(x for x in (when, tags) if x)
+        label = str(v["label"] or "").strip()
+        pin = f' <span class="tag keep">{e(label)}</span>' if label else ""
         cur = ' <span class="tag nice">current</span>' if n == latest and state == "done" else ""
         links = (f'<a href="/files/{token}.v{n}.pdf" download aria-label="Download version {n} as PDF">PDF</a>' if v["pdf"] else "") + \
                 f'<a href="/files/{token}.v{n}.tex" download aria-label="Download version {n} LaTeX source">.tex</a>'
-        items.append(f'<li><span class="vn">v{n}</span><span class="muted vm">{e(meta)}</span>{cur}<span class="vl">{links}</span></li>')
+        edit = f'<button type="button" class="lnk muted" data-act="edit-version" data-n="{n}" aria-label="Edit version {n}">Edit…</button>'
+        dele = ("" if n == latest else
+                f'<button type="button" class="lnk del" data-act="resume-delete" data-n="{n}" data-pinned="{int(bool(v["keep"]))}" '
+                f'aria-label="Delete version {n}">Delete</button>')
+        items.append(f'<li><span class="vn">v{n}</span><span class="muted vm">{e(meta)}</span>{pin}{cur}'
+                     f'<span class="vl">{edit}{links}{dele}</span></li>')
+    older = ""
+    if any(int(v["n"]) != latest and not v["keep"] for v in versions):
+        older = ('<button type="button" class="lnk del" data-act="resume-delete-older">Delete all older versions '
+                 '<span class="muted">(keeps the newest and pinned ones)</span></button>')
     return (f'<details class="hist"><summary>{icon("chevron", 14, 2.4)}History ({len(versions)})</summary>'
-            f'<ul>{"".join(items)}</ul></details>')
+            f'<ul>{"".join(items)}</ul>{older}</details>')
+
+
+def render_regen(r, versions: list | None) -> str:
+    """Collapsed Regenerate panel: what to change, which version to edit, and an optional label that pins the result."""
+    versions = versions or []
+    latest = int(versions[0]["n"]) if versions else None
+    opts = '<option value="">Master CV (start fresh)</option>' + "".join(
+        f'<option value="{int(v["n"])}"{" selected" if int(v["n"]) == latest else ""}>v{int(v["n"])}'
+        f'{" · " + e(v["label"]) if v["label"] else ""}{" (latest)" if int(v["n"]) == latest else ""}</option>' for v in versions)
+    return (f'<details class="regen"><summary>{icon("chevron", 14, 2.4)}Regenerate…</summary><div class="regenform">'
+            '<label>What should change?<textarea data-f="notes" rows="3" maxlength="2000" '
+            'placeholder="e.g. replace project X with Y, or shorten Z"></textarea></label>'
+            f'<label>Based on<select data-f="base">{opts}</select></label>'
+            '<label>Label (pins this version)<input data-f="label" maxlength="24" placeholder="e.g. final"></label>'
+            '<p class="small muted">Without instructions this regenerates from your master CV. With instructions, the chosen '
+            'version is edited and everything else stays as it is.</p>'
+            '<button type="button" class="btn primary" data-act="regen-go">Generate</button></div></details>')
 
 
 def render_tailor(r, versions: list | None = None) -> str:
@@ -416,7 +492,7 @@ def render_tailor(r, versions: list | None = None) -> str:
         box = (f'<div class="box fail" role="alert"><div class="frow">{icon("xcircle", 18)}<div>'
                f'<strong>Couldn\'t tailor this resume.</strong><div class="mono">{e(r["tj_error"] or "unknown error")}</div>'
                '</div></div><button type="button" class="btn" data-act="tailor">Retry</button></div>')
-        box += render_history(r, versions or [], state)
+        box += f'<div class="boxfoot">{render_regen(r, versions)}{render_history(r, versions or [], state)}</div>'
     elif state == "done":
         claims, notes, no_engine = split_warnings(r["tj_warnings"])
         has_pdf = bool(r["tj_pdf"])
@@ -438,14 +514,11 @@ def render_tailor(r, versions: list | None = None) -> str:
             warn += (f'<div class="warn" role="note"><div class="whead">{icon("alert", 18)}<strong>{head}</strong></div>'
                      "<ul>" + "".join(f"<li>{x}</li>" for x in items) + "</ul></div>")
         fit = ""
-        regen = '<button type="button" class="lnk muted" data-act="tailor">Regenerate</button>'
         if r["tailoring_md"]:
             fit = (f'<div class="fitwrap"><details class="fit"><summary>{icon("chevron", 14, 2.4)}Fit analysis &amp; what to learn</summary>'
-                   f'{render_fit(r["tailoring_md"], band(r["score"]))}</details>{regen}</div>')
-        else:
-            fit = f'<div class="fitwrap">{regen}</div>'
+                   f'{render_fit(r["tailoring_md"], band(r["score"]))}</details></div>')
         box = (f'<section class="box done" aria-label="Tailored resume">{stamp}<div class="dl">{pdf}{tex}</div>{warn}{fit}'
-               f'{render_history(r, versions or [], state)}</section>')
+               f'<div class="boxfoot">{render_regen(r, versions)}{render_history(r, versions or [], state)}</div></section>')
     elif r["tailoring_md"]:  # analysis made on the command line, no resume requested from the dashboard
         box = (f'<div class="fitwrap alone"><details class="fit"><summary>{icon("chevron", 14, 2.4)}Fit analysis &amp; what to learn</summary>'
                f'{render_fit(r["tailoring_md"], band(r["score"]))}</details></div>')
@@ -598,6 +671,14 @@ main{padding:8px 16px 24px;display:flex;flex-direction:column;gap:12px}
 .hist li{display:flex;flex-wrap:wrap;align-items:center;gap:0 8px;min-height:40px;border-top:1px solid var(--line)}
 .hist .vn{font-weight:600;min-width:28px}.hist .vl{margin-left:auto;display:flex;gap:4px;flex-shrink:0}
 .hist .vl a{display:inline-flex;align-items:center;min-height:40px;padding:0 8px}
+.hist .vl .lnk{padding:0 8px;font-size:13px}.hist .del,.lnk.del{color:var(--danger)}.hist>.lnk.del{margin-top:4px}
+.tag.keep{background:var(--accent-tint);color:var(--accent-fg)}
+.boxfoot{display:flex;flex-wrap:wrap;align-items:flex-start;gap:0 16px}.boxfoot>details{flex:1 1 100%}
+.regen{font-size:13px}.regen summary{min-height:40px;display:inline-flex;align-items:center;gap:6px;color:var(--muted);cursor:pointer;list-style:none}
+.regen summary::-webkit-details-marker{display:none}.regen summary .ic{transition:transform .15s}.regen[open] summary{color:var(--fg)}.regen[open] summary .ic{transform:rotate(90deg)}
+.regenform{display:flex;flex-direction:column;gap:10px;padding:4px 0 8px}.regenform label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--muted)}
+.regenform textarea,.regenform select,.regenform input{font:inherit;font-size:16px;color:var(--fg);background:var(--card);border:1px solid var(--line);border-radius:8px;padding:8px;width:100%}
+.regenform textarea{min-height:76px;resize:vertical}.regenform .btn{align-self:flex-start}
 .md{display:flex;flex-direction:column;gap:12px;font-size:14px;line-height:1.5;padding:4px 0 8px}.fitwrap.alone .md{padding:4px 14px 12px}
 .md h4{margin:0 0 4px;font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}
 .md p{margin:0}.md ul,.md ol{margin:0;padding-left:20px;display:flex;flex-direction:column;gap:3px}
@@ -730,12 +811,21 @@ async function refreshTailor(c){
     if(n&&old)old.replaceWith(n);
   }catch(e){}
 }
-async function startTailor(c){
+async function startTailor(c,opts){
   try{
-    const r=await fetch('/api/tailor',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:c.dataset.id})});
+    const r=await fetch('/api/tailor',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:c.dataset.id,...(opts||{})})});
     if(!r.ok){const j=await r.json().catch(()=>({}));throw new Error(j.error||r.status);}
     c.dataset.t0=Date.now();await refreshTailor(c);
   }catch(err){say('Could not start: '+err.message);}
+}
+async function deleteVersions(c,payload,msg){
+  if(!confirm(msg))return;
+  try{
+    const r=await fetch('/api/resume/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:c.dataset.id,...payload})});
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok)throw new Error(j.error||r.status);
+    say(j.deleted.length?('Deleted '+j.deleted.map(n=>'v'+n).join(', ')):'Nothing to delete');await refreshTailor(c);
+  }catch(err){say('Could not delete: '+err.message);}
 }
 function setKb(c){if(cur)cur.classList.remove('kb');cur=c;if(c){c.classList.add('kb');c.scrollIntoView({block:'nearest'});}}
 function move(d){
@@ -749,6 +839,12 @@ document.addEventListener('click',e=>{
   if(a){
     const c=a.closest('.card')||(a.closest('.collapsed')&&list.querySelector('.card[data-id="'+CSS.escape(a.closest('.collapsed').dataset.for)+'"]'));
     if(a.dataset.act==='tailor'&&c)startTailor(c);
+    else if(a.dataset.act==='regen-go'&&c){
+      const box=a.closest('.regen'),notes=$('[data-f=notes]',box).value.trim(),base=$('[data-f=base]',box).value,label=$('[data-f=label]',box).value.trim();
+      const o={notes,label};if(notes&&base!=='')o.base=+base;startTailor(c,o);}
+    else if(a.dataset.act==='edit-version'&&c){const box=$('.regen',c);if(box){box.open=true;$('[data-f=base]',box).value=a.dataset.n;$('[data-f=notes]',box).focus();}}
+    else if(a.dataset.act==='resume-delete'&&c)deleteVersions(c,{n:+a.dataset.n},'Delete version v'+a.dataset.n+(a.dataset.pinned==='1'?' (pinned: you labelled it to keep it)':'')+'? This cannot be undone.');
+    else if(a.dataset.act==='resume-delete-older'&&c)deleteVersions(c,{all_older:true},'Delete all older versions except the newest and the pinned ones? This cannot be undone.');
     else if(a.dataset.act==='undo')doUndo();
     else if(a.dataset.act==='details'&&c){const d=$('.desc',c),open=d.hidden;d.hidden=!open;a.setAttribute('aria-expanded',String(open));}
     else if(a.dataset.act==='more'){const o=more.classList.toggle('open');a.setAttribute('aria-expanded',String(o));}
@@ -775,7 +871,7 @@ document.addEventListener('keydown',e=>{
   else if(k==='u')doUndo();
   else if(cur&&/^[1-4]$/.test(k))setStatus(cur,['new','interested','applied','not_relevant'][+k-1],false);
   else if(cur&&k==='o'){const a=$('.title',cur);if(a)a.click();}
-  else if(cur&&k==='t'){const b=$('[data-act=tailor]',cur);if(b)b.click();}
+  else if(cur&&k==='t'){const b=$('[data-act=tailor]',cur);if(b)b.click();else{const g=$('.regen',cur);if(g){g.open=true;const f=$('[data-f=notes]',g);if(f)f.focus();}}}
   else return;
   if('jku1234ot'.includes(k))e.preventDefault();
 });

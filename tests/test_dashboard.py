@@ -95,6 +95,32 @@ class RenderingTests(unittest.TestCase):
         self.assertIn("A &amp; B", out)
 
 
+class RegenerateOptionTests(unittest.TestCase):
+    def setUp(self):
+        self._keep = fresh_db()
+        self.db = radar.open_db()
+        self.db.execute("INSERT INTO resume_versions (job_id, n) VALUES ('t:1', 1)")
+        self.db.commit()
+
+    def tearDown(self):
+        self.db.close()
+
+    def check(self, notes="", base=None, label=""):
+        return d.check_tailor_options(self.db, "t:1", notes, base, label)
+
+    def test_plain_regenerate_and_valid_edit_are_accepted(self):
+        self.assertIsNone(self.check())
+        self.assertIsNone(self.check("swap project A for B", 1, "final"))
+
+    def test_editing_a_version_needs_instructions_and_an_existing_version(self):
+        self.assertIn("describe", self.check("  ", 1))
+        self.assertIn("does not exist", self.check("x", 7))
+
+    def test_bad_labels_and_overlong_notes_are_rejected(self):
+        self.assertIn("label", self.check(label="a;b"))
+        self.assertIn("too long", self.check("x" * 2001))
+
+
 class HistoryRenderingTests(unittest.TestCase):
     def v(self, n, pdf=1, role="devops", lang="de", created="2026-11-16 09:03:00"):
         return Row(job_id="t:1", n=n, created=created, role=role, lang=lang, pdf=pdf)
@@ -154,6 +180,38 @@ class HistoryRenderingTests(unittest.TestCase):
         self.assertNotIn('vm"> ·', out)  # empty date: no leading separator
         self.assertIn('aria-label="Download version 2 as PDF"', out)
         self.assertIn('aria-label="Download version 1 LaTeX source"', out)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+
+class HistoryControlsTests(unittest.TestCase):
+    def v(self, n, label=None, keep=0):
+        return Row(job_id="t:1", n=n, created="2026-11-16 09:03:00", role="devops", lang="de", pdf=1, label=label, keep=keep)
+
+    def html(self, versions):
+        return d.render_tailor(Row(id="t:1", score=78, tj_state="done", tj_pdf=1, tj_warnings="[]",
+                                   tj_finished="2026-11-24 16:14:00"), versions)
+
+    def test_newest_version_has_no_delete_button_older_ones_do(self):
+        h = self.html([self.v(3), self.v(2), self.v(1)])
+        self.assertNotIn('data-act="resume-delete" data-n="3"', h)
+        self.assertIn('data-act="resume-delete" data-n="2"', h)
+        self.assertIn('data-act="resume-delete" data-n="1"', h)
+        self.assertIn("resume-delete-older", h)
+
+    def test_labels_are_shown_escaped_and_the_bulk_button_hides_when_only_pinned_remain(self):
+        h = self.html([self.v(2), self.v(1, "<b>x</b>", 1)])
+        self.assertIn("&lt;b&gt;x&lt;/b&gt;", h)
+        self.assertNotIn("<b>x</b>", h)
+        self.assertNotIn("resume-delete-older", h)
+
+    def test_regenerate_panel_defaults_to_the_latest_version(self):
+        h = self.html([self.v(2), self.v(1)])
+        self.assertIn('<option value="2" selected>', h)
+        self.assertIn("Master CV (start fresh)", h)
 
 
 if __name__ == "__main__":

@@ -59,7 +59,8 @@ def main() -> int:
             continue
         radar.log(f"tailoring {job_id}")
         try:
-            res = cv.run_request(db, job_id)
+            req = db.execute("SELECT notes, base_n, label FROM tailor_jobs WHERE job_id = ?", (job_id,)).fetchone()
+            res = cv.run_request(db, job_id, req["notes"] or "", req["base_n"], req["label"])
             finish(db, job_id, "done", int(res["pdf"]), res["warnings"])
             radar.log(f"done {job_id}: pdf={res['pdf']} warnings={len(res['warnings'])}")
         except Exception as e:  # one bad job must not stop the worker

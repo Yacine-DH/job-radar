@@ -374,7 +374,7 @@ def snapshot_version(db: sqlite3.Connection, job_id: str, role: str | None = Non
             dst.unlink(missing_ok=True)  # stale leftover of an aborted run
     db.execute("UPDATE resume_versions SET pdf = ? WHERE job_id = ? AND n = ?", (int(has_pdf), job_id, n))
     # Retention: delete the rows and commit first, then the files, so a failed commit never strands rows without files.
-    old = [r[0] for r in db.execute("SELECT n FROM resume_versions WHERE job_id = ? ORDER BY n DESC LIMIT -1 OFFSET ?",
+    old = [r[0] for r in db.execute("SELECT n FROM resume_versions WHERE job_id = ? AND keep = 0 ORDER BY n DESC LIMIT -1 OFFSET ?",
                                     (job_id, radar.KEEP_VERSIONS))]
     for o in old:
         db.execute("DELETE FROM resume_versions WHERE job_id = ? AND n = ?", (job_id, o))
@@ -399,11 +399,44 @@ def ensure_baseline(db: sqlite3.Connection, job_id: str) -> None:
     snapshot_version(db, job_id, warnings=warnings, created=created)
 
 
-def _gen_body(job: sqlite3.Row, analysis: str, master: str, extra: str = "", notes: str = "") -> tuple[str, str, str]:
+def set_label(db: sqlite3.Connection, job_id: str, n: int, label: str) -> None:
+    """Name a version (for example "final") and pin it: automatic retention never deletes a labelled version."""
+    if not radar.LABEL_RE.match(label):
+        raise ValueError("label: 1-24 letters, digits, space, dot, dash or underscore")
+    db.execute("UPDATE resume_versions SET label = ?, keep = 1 WHERE job_id = ? AND n = ?", (label, job_id, n))
+    db.commit()
+
+
+def delete_versions(db: sqlite3.Connection, job_id: str, n: int | None = None, all_older: bool = False) -> list[int]:
+    """Delete archived versions. The newest version is the current resume and is never deleted; `all_older` skips
+    pinned (labelled) versions, which must be deleted one by one. Rows go first, then files."""
+    rows = db.execute("SELECT n, keep FROM resume_versions WHERE job_id = ? ORDER BY n DESC", (job_id,)).fetchall()
+    if not rows:
+        raise ValueError("this job has no archived versions")
+    newest = rows[0]["n"]
+    if all_older:
+        targets = [r["n"] for r in rows[1:] if not r["keep"]]
+    else:
+        if n == newest:
+            raise ValueError("the newest version is your current resume: regenerate first, then delete this one")
+        if n not in {r["n"] for r in rows}:
+            raise ValueError(f"version {n} does not exist")
+        targets = [n]
+    token = radar.file_token(job_id)
+    for t in targets:
+        db.execute("DELETE FROM resume_versions WHERE job_id = ? AND n = ?", (job_id, t))
+    db.commit()
+    for t in targets:
+        for ext in ("tex", "pdf"):
+            radar.version_path(token, t, ext).unlink(missing_ok=True)
+    return targets
+
+
+def _gen_body(job: sqlite3.Row, analysis: str, master: str, extra: str = "", notes: str = "", base: str = "") -> tuple[str, str, str]:
     pre, master_body = split_master(master)
     owner = (f"OWNER INSTRUCTIONS (from the CV's owner for this one resume; follow them unless they conflict with the rules above, "
              f"above all: never invent facts or links):\n{notes.strip()}\n\n") if notes.strip() else ""
-    prompt = (
+    fresh = (
         "Adapt the resume below to ONE job. Output ONLY the LaTeX body that goes between \\begin{document} and "
         "\\end{document}: no preamble, no code fences, no commentary.\n"
         "Rules:\n"
@@ -422,6 +455,22 @@ def _gen_body(job: sqlite3.Row, analysis: str, master: str, extra: str = "", not
         "- It must fit ONE A4 page at the master's 10pt layout: be selective (about 3 projects, 2 bullets each).\n\n"
         f"{extra}{owner}JOB POSTING:\n{_job_block(job)}\nANALYSIS OF THE FIT (use its CV-tailoring advice):\n{analysis}\n\n"
         f"MASTER CV BODY (LaTeX, both languages in \\T, role variants via \\if..):\n{master_body}")
+    edit = (
+        "You are EDITING an existing one-page resume (BASE), not writing a new one. Output ONLY the full LaTeX body that goes "
+        "between \\begin{document} and \\end{document}: no preamble, no code fences, no commentary.\n"
+        "Rules:\n"
+        "- Apply the OWNER INSTRUCTIONS with the smallest possible change. Keep everything else in BASE exactly as it is: "
+        "wording, order, macros, links and the first line `% role=.. lang=..`.\n"
+        "- The MASTER CV is the only source of facts, numbers and links. Never add or invent a fact, skill, number or link. "
+        "Keep every \\plink URL exactly as in the master; a project without a \\plink stays plain text.\n"
+        "- When you replace or add an entry, write it in the language of BASE with the same macros (\\entry{..}{..}{..}, "
+        "itemize) and take its facts from the master only.\n"
+        "- It must still fit ONE A4 page: if a change does not fit, shorten the entry you were asked to change before "
+        "touching anything else.\n"
+        "- Do not use \\T, \\if.. switches, \\newcommand, or load packages.\n\n"
+        f"{extra}{owner}JOB POSTING:\n{_job_block(job)}\n\nBASE RESUME BODY (edit this):\n{base}\n\n"
+        f"MASTER CV BODY (source of facts):\n{master_body}")
+    prompt = edit if base else fresh
     text = radar.ask_claude(prompt, RESUME_SYSTEM, timeout=600).strip()
     fence = re.search(r"```(?:latex|tex)?\n(.*?)```", text, re.S)
     body = (fence.group(1) if fence else text).strip()
@@ -431,7 +480,8 @@ def _gen_body(job: sqlite3.Row, analysis: str, master: str, extra: str = "", not
     return body, role, lang
 
 
-def resume_job(db: sqlite3.Connection, job: sqlite3.Row, analysis: str, notes: str = "") -> dict:
+def resume_job(db: sqlite3.Connection, job: sqlite3.Row, analysis: str, notes: str = "", base_n: int | None = None,
+               label: str | None = None) -> dict:
     """Generate a tailored resume for `job`. Returns {pdf, warnings, role, lang}; raises on unusable output."""
     master = radar.CV_TEX.read_text()
     pre, _ = split_master(master)
@@ -442,6 +492,12 @@ def resume_job(db: sqlite3.Connection, job: sqlite3.Row, analysis: str, notes: s
     ensure_baseline(db, job["id"])  # keep what exists today as a version before it is overwritten
     pdf_path.unlink(missing_ok=True)
     warnings: list[str] = []
+    base = ""
+    if base_n is not None:  # edit an archived version instead of starting from the master
+        base_tex = radar.version_path(token, base_n, "tex")
+        if not base_tex.exists():
+            raise RuntimeError(f"version {base_n} is not available any more")
+        base = split_master(base_tex.read_text())[1].strip()
     extra, body, role, lang = "", "", "swe", "en"
     feedback: list[str] = []  # retry notes accumulate, so a later retry never drops an earlier constraint
     claim_retried = False
@@ -453,7 +509,7 @@ def resume_job(db: sqlite3.Connection, job: sqlite3.Row, analysis: str, notes: s
     for attempt in range(3):
         last = attempt == 2
         notes_now: list[str] = []  # warnings of THIS draft: a discarded draft must not leak into the accepted one
-        body, role, lang = _gen_body(job, analysis, master, extra, notes)
+        body, role, lang = _gen_body(job, analysis, master, extra, notes, base)
         err = validate_body(body, master)
         if err:
             if last:
@@ -508,28 +564,53 @@ def resume_job(db: sqlite3.Connection, job: sqlite3.Row, analysis: str, notes: s
     if pdf_path.exists():
         pdf_path.chmod(0o600)  # tectonic writes it group/world-readable
     version = snapshot_version(db, job["id"], role, lang, warnings)
-    return {"pdf": pdf_path.exists(), "warnings": warnings, "role": role, "lang": lang, "version": version}
+    if label and version:
+        set_label(db, job["id"], version, label)
+    return {"pdf": pdf_path.exists(), "warnings": warnings, "role": role, "lang": lang, "version": version, "label": label}
 
 
-def run_request(db: sqlite3.Connection, job_id: str, notes: str = "") -> dict:
-    """What the worker does for one queued dashboard request: analysis, then resume."""
+def run_request(db: sqlite3.Connection, job_id: str, notes: str = "", base_n: int | None = None, label: str | None = None) -> dict:
+    """What the worker does for one queued dashboard request: analysis (reused when editing a version), then resume."""
     job = db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
     if job is None:
         raise RuntimeError("unknown job")
     if not radar.CV_TEX.exists():
         raise RuntimeError("cv/cv-content.tex is missing")
-    analysis = tailor_job(db, job)
-    return resume_job(db, job, analysis, notes)
+    stored = db.execute("SELECT markdown FROM tailoring WHERE job_id = ?", (job_id,)).fetchone() if base_n is not None else None
+    analysis = stored["markdown"] if stored else tailor_job(db, job)  # editing a version does not need a new analysis
+    return resume_job(db, job, analysis, notes, base_n, label)
 
 
-def resume(ref: str, notes: str = "") -> int:
+def resume(ref: str, notes: str = "", base_n: int | None = None, label: str | None = None) -> int:
+    if label and not radar.LABEL_RE.match(label):
+        sys.exit("label: 1-24 letters, digits, space, dot, dash or underscore")
     db = radar.open_db()
     job = _find_job(db, ref)
-    res = run_request(db, job["id"], notes)
+    res = run_request(db, job["id"], notes, base_n, label or None)
     token = radar.file_token(job["id"])
     print(f"role={res['role']} lang={res['lang']} pdf={res['pdf']}\n{radar.TAILORED_DIR / token}.tex")
     for w in res["warnings"]:
         print("WARNING:", w)
+    return 0
+
+
+def list_versions(ref: str) -> int:
+    db = radar.open_db()
+    job = _find_job(db, ref)
+    for v in db.execute("SELECT n, created, role, lang, pdf, label, keep FROM resume_versions WHERE job_id = ? ORDER BY n DESC", (job["id"],)):
+        print(f"v{v['n']:<3} {v['created']}  {v['lang'] or '?'}/{v['role'] or '?'}  {'pdf' if v['pdf'] else 'tex'}"
+              f"{'  [' + v['label'] + ', pinned]' if v['keep'] else ''}")
+    return 0
+
+
+def delete_cli(ref: str, n: int | None, all_older: bool) -> int:
+    if n is None and not all_older:
+        sys.exit("give a version number or --all-older")
+    db = radar.open_db()
+    try:
+        print("deleted:", delete_versions(db, _find_job(db, ref)["id"], n, all_older) or "nothing")
+    except ValueError as exc:
+        sys.exit(str(exc))
     return 0
 
 
@@ -613,12 +694,18 @@ def main() -> int:
     r = sub.add_parser("resume"); r.add_argument("job_id")
     r.add_argument("--notes", default="", help="instructions for this resume (what to emphasise, what to group)")
     r.add_argument("--notes-file", help="read the instructions from a file instead")
+    r.add_argument("--base", type=int, help="edit this archived version (needs --notes) instead of starting from the master")
+    r.add_argument("--label", default="", help="name and pin the new version, for example final")
+    v = sub.add_parser("versions"); v.add_argument("job_id")
+    d = sub.add_parser("delete-version"); d.add_argument("job_id"); d.add_argument("n", type=int, nargs="?")
+    d.add_argument("--all-older", action="store_true", help="delete every older version except pinned ones")
     c = sub.add_parser("recompile"); c.add_argument("job_id", nargs="?")
     s = sub.add_parser("skills"); s.add_argument("--min-score", type=int, default=50)
     a = ap.parse_args()
     radar.load_env()
     return {"build": lambda: build(a.force), "tailor": lambda: tailor(a.job_id),
-            "resume": lambda: resume(a.job_id, Path(a.notes_file).read_text() if a.notes_file else a.notes), "recompile": lambda: recompile(a.job_id),
+            "resume": lambda: resume(a.job_id, Path(a.notes_file).read_text() if a.notes_file else a.notes, a.base, a.label),
+            "versions": lambda: list_versions(a.job_id), "delete-version": lambda: delete_cli(a.job_id, a.n, a.all_older), "recompile": lambda: recompile(a.job_id),
             "skills": lambda: skills(a.min_score)}[a.cmd]()
 
 

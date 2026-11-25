@@ -446,6 +446,11 @@ def open_db() -> sqlite3.Connection:
     db.execute("""CREATE TABLE IF NOT EXISTS resume_versions (
         job_id TEXT NOT NULL, n INTEGER NOT NULL, created TEXT DEFAULT CURRENT_TIMESTAMP,
         role TEXT, lang TEXT, pdf INTEGER NOT NULL DEFAULT 0, warnings TEXT, PRIMARY KEY (job_id, n))""")
+    # Owner instructions, the version to edit and a label for the result travel with a queued request; a label pins a version.
+    for table, col, ddl in (("tailor_jobs", "notes", "TEXT"), ("tailor_jobs", "base_n", "INTEGER"), ("tailor_jobs", "label", "TEXT"),
+                            ("resume_versions", "label", "TEXT"), ("resume_versions", "keep", "INTEGER NOT NULL DEFAULT 0")):
+        if col not in {r["name"] for r in db.execute(f"PRAGMA table_info({table})")}:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
     if "distance_km" not in cols:
         db.execute("ALTER TABLE jobs ADD COLUMN distance_km REAL")
         for r in db.execute("SELECT id, description FROM jobs WHERE source = 'BA'").fetchall():
@@ -524,7 +529,8 @@ TRACKS = ("swe", "devops", "ml")
 TAILORED_DIR = CV_DIR / "tailored"  # generated resumes (git-ignored with cv/)
 
 
-KEEP_VERSIONS = 10  # archived resume versions kept per job
+KEEP_VERSIONS = 10  # unpinned archived resume versions kept per job (a labelled version is pinned and never pruned)
+LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.-]{0,23}$")  # a version label such as "final"
 
 
 def version_path(token: str, n: int, ext: str) -> Path:
