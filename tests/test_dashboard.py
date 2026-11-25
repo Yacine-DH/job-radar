@@ -362,6 +362,37 @@ class FrontPageTests(unittest.TestCase):
         import demo
         self.assertIn(f"Showing {len(demo.JOBS) - 1} of", self.page(status="all"))  # everything but the archived job
 
+    @staticmethod
+    def visible_ids(html):
+        import re
+        out = set()
+        for attrs in re.findall(r'<article class="card"([^>]*)>', html):
+            if " hidden" not in attrs:
+                out.add(re.search(r'data-id="([^"]+)"', attrs).group(1))
+        return out
+
+    def test_the_server_fallback_uses_the_shared_search_and_matches_every_term(self):
+        both = self.visible_ids(self.page(status="all", q="docker linux"))
+        self.assertEqual(both, {"demo:1"})
+        self.assertEqual(self.visible_ids(self.page(status="all", q="LINUX   Docker")), both)    # any order and case
+        self.assertEqual(self.visible_ids(self.page(status="all", q="docker kubernetesx")), set())  # every term must match
+        self.assertEqual(len(self.visible_ids(self.page(status="all", q=""))), len(__import__("demo").JOBS) - 1)
+
+    def test_ui_labels_do_not_match_in_the_server_fallback_either(self):
+        for label in ("applied", "posting details", "tailor resume", "not relevant"):
+            self.assertEqual(self.visible_ids(self.page(status="all", q=label)), set(), label)
+
+    def test_the_server_fallback_ignores_description_text_past_the_cap(self):
+        con = sqlite3.connect(radar.DB_PATH)
+        try:
+            con.execute("UPDATE jobs SET description = ? WHERE id = 'demo:2'", ("x" * d.SEARCH_DESC_CHARS + " needlepastcap",))
+            con.execute("UPDATE jobs SET description = ? WHERE id = 'demo:3'", ("needlewithincap " + "x" * 20,))
+            con.commit()
+        finally:
+            con.close()
+        self.assertEqual(self.visible_ids(self.page(status="all", q="needlepastcap")), set())
+        self.assertEqual(self.visible_ids(self.page(status="all", q="needlewithincap")), {"demo:3"})
+
     def test_the_script_knows_the_views_the_undo_toast_and_the_archive_flag(self):
         h = self.page()
         for needle in ("c.dataset.old==='1'", "showView(", "['Undo','undo']", "delete c.dataset.old",
