@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Link and enable the job radar's systemd *user* units from this repo. Safe to re-run.
-# The unit files hard-code /home/user/job-radar and the Tailscale IP: edit them first on another machine.
+# The units expect the checkout at ~/job-radar (%h/job-radar); the dashboard's Tailscale address goes into .env.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 units=(job-radar.service job-radar.timer job-radar-dashboard.service job-radar-worker.service)

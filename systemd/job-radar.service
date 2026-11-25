@@ -5,8 +5,8 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=/home/user/job-radar
-Environment=PATH=/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/usr/bin/python3 -I /home/user/job-radar/radar.py
+WorkingDirectory=%h/job-radar
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 -I %h/job-radar/radar.py
 Nice=10
 TimeoutStartSec=15min

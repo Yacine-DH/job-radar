@@ -47,6 +47,9 @@ The demo cannot generate resumes (that needs your own CV and `claude`); it shows
 - **Keeps history:** every generated resume is archived as a numbered version. Regenerate from scratch or edit a chosen
   version with instructions; label a version to pin it; delete any version you do not want.
 - **Shows the gaps:** a weekly report of the skills your CV lacks that postings ask for most.
+- **Never loses a decision:** the counters at the top (New, Interested, Applied) and the Skipped/Archived chips open those
+  jobs with their resumes; every status change shows an Undo; skipped jobs move to Archived after 7 days (kept in the
+  database so they are never fetched again as new).
 
 Private projects carry a small padlock instead of the arrow that marks a clickable project name in the resume.
 
@@ -86,7 +89,8 @@ PDFs need a XeTeX engine; the master CV uses `fontspec`, so `pdflatex` will not 
 [tectonic](https://tectonic-typesetting.github.io/) and put it on `PATH` or at `~/.local/bin/tectonic`. Without it
 the tailor button still produces the `.tex`.
 
-The unit files hard-code the author's paths and Tailscale address: edit them before installing elsewhere.
+The units expect the checkout at `~/job-radar`. Put your Tailscale address in `.env` as `DASHBOARD_HOST` (and the
+names you open it by in `DASHBOARD_ALLOWED_HOSTS`); the dashboard refuses to start on any other kind of address.
 
 ## Everyday commands
 
@@ -111,6 +115,10 @@ journalctl --user -u job-radar.service # logs of the daily run
 `GMAIL_USER`, `GMAIL_APP_PASSWORD` (a Google app password, not your account password), `MAIL_TO`, `DASHBOARD_URL`.
 Optional: `JOB_RADAR_CONTACT`, a contact appended to the User-Agent. It is empty by default, so no personal data is
 sent to job sites unless you opt in.
+
+## License
+
+[MIT](LICENSE).
 
 ## Security and privacy
 

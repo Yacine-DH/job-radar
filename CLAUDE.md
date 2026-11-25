@@ -2,7 +2,8 @@
 
 Personal tool for one user (CS student, TU Darmstadt, max 20 h/week): finds Werkstudent jobs within 30 km of
 Darmstadt, ranks them with `claude -p` against the user's CV, emails a digest and serves a private dashboard.
-Runs on the home server `my-server` (Ubuntu, 24/7). Private repo: `git@github.com:Yacine-DH/job-radar.git`.
+Runs on the owner's home server (Ubuntu, 24/7). Public repo (MIT): `git@github.com:Yacine-DH/job-radar.git`; the old private
+repo with the unscrubbed history is archived as `Yacine-DH/job-radar-archive`.
 
 ## How the user wants to work
 - **Explain each step before running commands.** Ask before outward-facing actions (git push, sending mail,
@@ -22,6 +23,8 @@ Runs on the home server `my-server` (Ubuntu, 24/7). Private repo: `git@github.co
 - `systemd/` - the units (`job-radar.timer|service`, `job-radar-dashboard.service`, `job-radar-worker.service`) and
   `install.sh`, which links and enables them (idempotent). They are symlinked into `~/.config/systemd/user`, so
   moving a unit file breaks the links: re-run `systemd/install.sh`. After editing a unit: `daemon-reload` + restart.
+- `demo.py` - the real dashboard on made-up data in a temp dir (`.venv/bin/python demo.py`, `--snapshot FILE`); also used
+  by the tests. `LICENSE` is MIT.
 - `tests/` - stdlib `unittest`, fake data only, never touches the real DB/CV/network:
   `.venv/bin/python -m unittest discover -s tests -t .` (run it after changing logic; add tests for new logic).
 - `docs/design-brief.md` (brief for UI work) and `docs/design-handoff.md` (the redesign the dashboard follows).
@@ -35,7 +38,7 @@ Runs on the home server `my-server` (Ubuntu, 24/7). Private repo: `git@github.co
   placed before the posting and never override the no-invention rule, link allow-list or fact check.
 - Timer: Mon-Fri 08:00 Europe/Berlin (`job-radar.timer`). The daily email is sent even when nothing is new
   (heartbeat) and names failed sources. Logs: `journalctl --user -u job-radar.service`.
-- Dashboard: `http://100.64.0.1:8090/` (Tailscale only). Worker: `journalctl --user -u job-radar-worker`.
+- Dashboard: `http://<DASHBOARD_HOST from .env>:8090/` (Tailscale only). Worker: `journalctl --user -u job-radar-worker`.
 
 ## Gotchas
 - Always run scripts with `python3 -I`; they insert their own directory into `sys.path`. radar/cv/worker are
@@ -57,7 +60,7 @@ consider a password before exposing anything more sensitive.
 
 ## Never commit (all git-ignored)
 `.env*`, `jobs.db`, `cv/` (master CV `cv-content.tex`, derived `profile.md`, generated resumes), `profile.md`,
-`.orca/`, `.venv/`. The CV contains personal contact data, so the repo must stay private. A stray `.env.`
+`.orca/`, `.venv/`. The repo is PUBLIC: never commit the CV, contact data, hostnames or addresses. A stray `.env.`
 file may exist: it is ignored, check it for leftover credentials.
 
 ## Privacy rule: the owner's email address
@@ -83,8 +86,9 @@ user's past status decisions. Email shows at most `TOP_N` cards scoring >= `MIN_
 - Clickable names: the master CV defines `\plink{url}{text}` (name + small arrow) for projects/events that have a repo
   or site; every `\plink` URL in a generated resume must already exist in the master (validator). Private projects get
   no link. The master on the server and the owner's laptop copy can diverge: tell the owner to sync after edits.
-- The server has no Node or browser, so the dashboard's client-side JS has only had static checks (bracket balance,
-  DOM hooks present, server HTML verified with curl). Verify interactions on a real phone/laptop after changes.
+- The server has Node 22 (`~/.local/bin/node`) but no browser or DOM library: the dashboard script is syntax-checked with
+  `node --check` on the script extracted from `demo.py --snapshot`, and pure functions (e.g. `okStatus`) can be run in Node.
+  Click paths are still untested: verify interactions on a real phone/laptop after changes.
 - Auto-mode blocks unrequested downloads and `pip install` here (the tectonic download only went through after the
   owner explicitly asked for it); ask the owner first instead of retrying.
 - Other sessions/tools edit this repo too (`q`/`sort` search, `status_at`, `--rescore`, `feedback_block` were not

@@ -5,17 +5,16 @@ After=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/user/job-radar
-Environment=DASHBOARD_HOST=100.64.0.1
+WorkingDirectory=%h/job-radar
+# DASHBOARD_HOST (your Tailscale IP) and DASHBOARD_ALLOWED_HOSTS are read from .env
 Environment=DASHBOARD_PORT=8090
-Environment=DASHBOARD_ALLOWED_HOSTS=my-server.example.ts.net,100.64.0.1
-ExecStart=/home/user/job-radar/.venv/bin/python -I /home/user/job-radar/dashboard.py
+ExecStart=%h/job-radar/.venv/bin/python -I %h/job-radar/dashboard.py
 Restart=on-failure
 RestartSec=10
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
-ReadWritePaths=/home/user/job-radar
+ReadWritePaths=%h/job-radar
 
 [Install]
 WantedBy=default.target

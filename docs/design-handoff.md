@@ -95,4 +95,4 @@ Existing tokens (`--bg --card --fg --muted --line --accent --high --mid --low`) 
 3. Client-side filters, Skip collapse/Undo, keyboard. 4. `build_email` variants. 5. Empty states. 6. `/gaps` page.
 Check at 360 px and in dark mode after each step.
 
-Design canvas (private, owner only): (link removed)
+Design canvas: kept privately by the owner.
