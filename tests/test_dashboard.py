@@ -62,7 +62,8 @@ class RenderingTests(unittest.TestCase):
         idle = d.render_tailor(Row(base))
         self.assertIn('data-state="idle"', idle)
         self.assertIn("Tailor resume", idle)
-        pending = d.render_tailor(Row(base, tj_state="running", tj_requested="2026-11-16 08:13:00"))
+        now = datetime(2026, 11, 16, 8, 14, tzinfo=d.timezone.utc)
+        pending = d.render_tailor(Row(base, tj_state="running", tj_requested="2026-11-16 08:13:00", tj_started="2026-11-16 08:13:05"), None, 5.0, now)
         self.assertIn("data-pending", pending)
         self.assertIn('role="status"', pending)
         failed = d.render_tailor(Row(base, tj_state="failed", tj_error="<boom>"))
@@ -248,8 +249,11 @@ class DemoTests(unittest.TestCase):
 
     def test_the_card_of_the_demo_job_renders_gaps_history_and_the_pinned_label(self):
         row = self.db.execute(d.ROW_SQL + " WHERE jobs.id = 'demo:1'").fetchone()
-        with d.db() as con:
+        con = d.db()
+        try:  # a `with` on a sqlite connection commits but does not close it
             versions = d.versions_for(con, ["demo:1"])["demo:1"]
+        finally:
+            con.close()
         html = d.render_tailor(row, versions) + d.fit_details(row)
         for needle in ("gapcard crit", "2 gaps", "History (3)", 'class="tag keep">final', 'data-act="resume-delete" data-n="1"'):
             self.assertIn(needle, html)
@@ -457,6 +461,42 @@ class RouteTests(unittest.TestCase):
         self.assertEqual((radar.TAILORED_DIR / f"{self.token}.tex").read_bytes(), b"v1")  # v1 is current again
 
 
+    def test_cancel_route(self):
+        con = sqlite3.connect(radar.DB_PATH)
+        con.execute("INSERT INTO tailor_jobs (job_id, state, requested) VALUES ('t:1', 'queued', CURRENT_TIMESTAMP)")
+        con.commit()
+        con.close()
+        self.assertEqual(self.call(d.cancel_tailor, d.CancelRequest(id="t:1"), origin="http://evil.example")[0], 403)
+        # t:1 has archived versions in this fixture: cancelling restores the 'done' card
+        self.assertEqual(self.call(d.cancel_tailor, d.CancelRequest(id="t:1")), (200, {"state": "cancelled"}))
+        con = sqlite3.connect(radar.DB_PATH)
+        try:
+            self.assertEqual(con.execute("SELECT state FROM tailor_jobs WHERE job_id = 't:1'").fetchone()[0], "done")
+        finally:
+            con.close()
+        self.assertEqual(self.call(d.cancel_tailor, d.CancelRequest(id="t:1"))[0], 409)       # nothing pending any more
+
+    def test_cancel_route_returns_503_on_a_locked_database(self):
+        from unittest import mock
+        with mock.patch.object(d.cv, "cancel_request", side_effect=sqlite3.OperationalError("database is locked")):
+            self.assertEqual(self.call(d.cancel_tailor, d.CancelRequest(id="t:1"))[0], 503)
+
+    def test_the_fragment_reads_the_worker_heartbeat_from_the_database(self):
+        con = sqlite3.connect(radar.DB_PATH)
+        con.execute("INSERT INTO tailor_jobs (job_id, state, requested) VALUES ('t:1', 'queued', ?)", (radar.ts_str(radar.utc_now()),))
+        con.commit()
+        con.close()
+        offline = d.tailor_fragment("t:1").body.decode()
+        self.assertIn('data-pending-kind="offline"', offline)               # no heartbeat yet
+        con = sqlite3.connect(radar.DB_PATH)
+        try:
+            radar.beat(con)
+        finally:
+            con.close()
+        online = d.tailor_fragment("t:1").body.decode()
+        self.assertNotIn("offline", online.lower())
+        self.assertIn('role="status"', online)
+
     def test_a_locked_database_is_a_503_not_a_crash(self):
         from unittest import mock
         err = sqlite3.OperationalError("database is locked")
@@ -495,6 +535,81 @@ class MigrationTests(unittest.TestCase):
             radar.open_db().close()  # opening twice must not fail on the existing columns
         finally:
             db.close()
+
+
+class PendingStatesTests(unittest.TestCase):
+    """Offline / slow / normal pending cards, with an injected clock."""
+    NOW = datetime(2026, 11, 16, 12, 0, tzinfo=d.timezone.utc)
+
+    def row(self, state="queued", requested="2026-11-16 11:59:00", started=None):
+        return Row(id="t:1", score=60, tj_state=state, tj_requested=requested, tj_started=started)
+
+    def box(self, state="queued", age=5.0, **kw):
+        return d.pending_box(self.row(state, **kw), state, age, self.NOW)
+
+    def test_normal_pending_is_a_polite_status_without_cancel(self):
+        h = self.box()
+        self.assertIn('role="status"', h)
+        self.assertNotIn("tailor-cancel", h)
+        self.assertNotIn("offline", h.lower())
+
+    def test_an_offline_worker_is_an_alert_that_says_since_when_and_offers_cancel(self):
+        h = self.box(age=600.0)                       # last beat 11:50 UTC = 12:50 Berlin
+        self.assertIn('role="alert"', h)
+        self.assertIn('data-pending-kind="offline"', h)
+        self.assertIn("Worker offline since 12:50", h)
+        self.assertIn('data-act="tailor-cancel"', h)
+
+    def test_a_worker_that_never_reported_is_offline_without_a_time(self):
+        h = self.box(age=None)
+        self.assertIn("<strong>Worker offline.</strong>", h)
+        self.assertIn("tailor-cancel", h)
+
+    def test_the_stale_limit_is_the_boundary(self):
+        self.assertNotIn("offline", self.box(age=radar.WORKER_STALE_SECONDS).lower())
+        self.assertIn("offline", self.box(age=radar.WORKER_STALE_SECONDS + 1).lower())
+
+    def test_a_slow_queued_request_is_an_alert_with_cancel(self):
+        h = self.box("queued", requested="2026-11-16 11:50:00")        # 10 minutes
+        self.assertIn('role="alert"', h)
+        self.assertIn('data-pending-kind="slow"', h)
+        self.assertIn("Taking longer than expected", h)
+        self.assertIn("10 minutes", h)
+        self.assertIn("tailor-cancel", h)
+
+    def test_a_slow_running_request_has_no_cancel_while_a_live_worker_is_on_it(self):
+        h = self.box("running", requested="2026-11-16 11:40:00", started="2026-11-16 11:50:00")
+        self.assertIn("Taking longer than expected", h)
+        self.assertNotIn("tailor-cancel", h)
+
+    def test_an_overdue_running_request_can_be_cancelled_even_with_a_live_worker(self):
+        h = self.box("running", requested="2026-11-16 11:30:00", started="2026-11-16 11:40:00")       # 20 minutes running
+        self.assertIn("tailor-cancel", h)
+        self.assertIn("the worker is still on it", h)
+        self.assertNotIn("still in the queue", h)
+        h = self.box("running", requested="2026-11-16 11:50:00", started=None)                      # start time unknown
+        self.assertIn("tailor-cancel", h)
+
+    def test_a_running_request_within_its_time_has_no_cancel(self):
+        h = self.box("running", requested="2026-11-16 11:40:00", started="2026-11-16 11:50:00")       # slow (10 min) but not overdue
+        self.assertIn("Taking longer than expected", h)
+        self.assertNotIn("tailor-cancel", h)
+
+    def test_running_time_counts_from_the_start_not_from_the_request(self):
+        waited_long_but_just_started = self.box("running", requested="2026-11-16 11:00:00", started="2026-11-16 11:59:30")
+        self.assertIn('role="status"', waited_long_but_just_started)
+
+    def test_offline_wins_over_slow_and_render_tailor_passes_the_age_through(self):
+        h = d.render_tailor(self.row("queued", requested="2026-11-16 11:00:00"), None, 900.0, self.NOW)
+        self.assertIn('data-pending-kind="offline"', h)
+        self.assertIn("data-pending", h)             # the page keeps polling while it is pending
+
+    def test_the_script_keeps_polling_after_five_minutes_and_can_cancel(self):
+        import inspect
+        src = inspect.getsource(d)
+        self.assertIn("cancelTailor(c)", src)
+        self.assertIn("/api/tailor/cancel", src)
+        self.assertIn("age<1800000", src)
 
 
 class FitPanelTests(unittest.TestCase):

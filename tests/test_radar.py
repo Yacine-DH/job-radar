@@ -1,6 +1,7 @@
 import os
 import re
 import unittest
+from datetime import datetime, timedelta, timezone
 
 from tests.helpers import Row, fresh_db, insert_job, radar
 
@@ -62,6 +63,127 @@ class DistanceAndDedupTests(unittest.TestCase):
         radar.store_new(db, [{**job, "id": "an:9", "source": "Arbeitnow"}, {**job, "id": "ba:1"}])
         self.assertEqual(db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 1)
         db.close()
+
+
+class WorkerQueueTests(unittest.TestCase):
+    T0 = datetime(2026, 11, 16, 12, 0, 0, tzinfo=timezone.utc)
+
+    def setUp(self):
+        self._keep = fresh_db()
+        self.db = radar.open_db()
+
+    def tearDown(self):
+        self.db.close()
+
+    def at(self, seconds):
+        return self.T0 + timedelta(seconds=seconds)
+
+    def test_heartbeat_age_with_a_fake_clock(self):
+        self.assertIsNone(radar.worker_age(self.db, self.T0))               # never reported
+        radar.beat(self.db, self.T0)
+        self.assertEqual(radar.worker_age(self.db, self.at(30)), 30.0)
+        radar.beat(self.db, self.at(40))                                    # a new beat replaces the old one
+        self.assertEqual(radar.worker_age(self.db, self.at(50)), 10.0)
+        self.assertEqual(radar.worker_age(self.db, self.at(-5)), 0.0)       # clock skew never gives a negative age
+
+    def test_online_boundary(self):
+        self.assertFalse(radar.worker_online(None))
+        self.assertTrue(radar.worker_online(radar.WORKER_STALE_SECONDS))
+        self.assertFalse(radar.worker_online(radar.WORKER_STALE_SECONDS + 0.1))
+
+    def add(self, job_id, state, started=None):
+        self.db.execute("INSERT INTO tailor_jobs (job_id, state, started) VALUES (?, ?, ?)",
+                        (job_id, state, None if started is None else radar.ts_str(started)))
+        self.db.commit()
+
+    def state(self, job_id):
+        return self.db.execute("SELECT state, started FROM tailor_jobs WHERE job_id = ?", (job_id,)).fetchone()[:]
+
+    def test_only_overdue_running_requests_are_requeued(self):
+        self.add("a", "running", self.at(-radar.RUNNING_STALE_SECONDS - 1))   # overdue
+        self.add("b", "running", self.at(-radar.RUNNING_STALE_SECONDS + 5))   # still within its time
+        self.add("c", "running", None)                                         # no start time: left alone
+        self.add("d", "queued")
+        self.add("e", "done", self.at(-5000))
+        self.assertEqual(radar.requeue_stale(self.db, self.T0), ["a"])
+        self.assertEqual(self.state("a"), ("queued", None))
+        self.assertEqual(self.state("b")[0], "running")
+        self.assertEqual(self.state("c")[0], "running")
+        self.assertEqual(self.state("e")[0], "done")
+        self.assertEqual(radar.requeue_stale(self.db, self.T0), [])           # idempotent
+
+    def test_a_request_restarted_between_the_check_and_the_update_is_not_requeued(self):
+        self.add("a", "running", self.at(-radar.RUNNING_STALE_SECONDS - 100))
+        racer = self
+
+        class Racing:
+            """Lets a fresh start of the same request happen right before requeue_stale's UPDATE."""
+            def __init__(self, inner):
+                self.inner, self.done = inner, False
+
+            def execute(self, sql, *args):
+                if sql.lstrip().startswith("UPDATE tailor_jobs SET state = 'queued'") and not self.done:
+                    self.done = True
+                    self.inner.execute("UPDATE tailor_jobs SET started = ? WHERE job_id = 'a'", (radar.ts_str(racer.T0),))
+                return self.inner.execute(sql, *args)
+
+            def commit(self):
+                return self.inner.commit()
+
+            def rollback(self):
+                return self.inner.rollback()
+
+        self.assertEqual(radar.requeue_stale(Racing(self.db), self.T0), [])
+        self.assertEqual(self.state("a")[0], "running")
+
+    def test_requeue_waits_for_the_write_lock_when_there_is_work_and_leaves_nothing_half_done(self):
+        import sqlite3
+        self.add("a", "running", self.at(-radar.RUNNING_STALE_SECONDS - 1))
+        other = radar.open_db()
+        try:
+            other.execute("BEGIN IMMEDIATE")                             # another writer is active
+            self.db.execute("PRAGMA busy_timeout = 50")
+            with self.assertRaises(sqlite3.OperationalError):
+                radar.requeue_stale(self.db, self.T0)
+        finally:
+            other.rollback()
+            other.close()
+        self.assertFalse(self.db.in_transaction)
+        self.assertEqual(self.state("a")[0], "running")
+        self.assertEqual(radar.requeue_stale(self.db, self.T0), ["a"])   # and works once the lock is free
+
+    def test_requeue_takes_no_write_lock_when_nothing_is_overdue(self):
+        self.add("a", "running", self.at(-10))
+        other = radar.open_db()
+        try:
+            other.execute("BEGIN IMMEDIATE")                             # another writer is active
+            self.assertEqual(radar.requeue_stale(self.db, self.T0), [])  # nothing to do: no lock needed, no error
+        finally:
+            other.rollback()
+            other.close()
+
+    def test_an_old_database_gains_meta_and_started(self):
+        import tempfile
+        from pathlib import Path
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        old = radar.DB_PATH
+        self.addCleanup(setattr, radar, "DB_PATH", old)
+        radar.DB_PATH = Path(tmp.name) / "old.db"
+        import sqlite3
+        con = sqlite3.connect(radar.DB_PATH)
+        con.execute("CREATE TABLE tailor_jobs (job_id TEXT PRIMARY KEY, state TEXT NOT NULL, requested TEXT, finished TEXT, error TEXT, pdf INTEGER NOT NULL DEFAULT 0, warnings TEXT)")
+        con.execute("INSERT INTO tailor_jobs (job_id, state) VALUES ('t:1', 'queued')")
+        con.commit()
+        con.close()
+        db = radar.open_db()
+        try:
+            self.assertIn("started", {r["name"] for r in db.execute("PRAGMA table_info(tailor_jobs)")})
+            radar.beat(db, self.T0)
+            self.assertEqual(db.execute("SELECT state FROM tailor_jobs").fetchone()[0], "queued")
+            radar.open_db().close()
+        finally:
+            db.close()
 
 
 class EmailTests(unittest.TestCase):

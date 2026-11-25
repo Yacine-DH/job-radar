@@ -120,7 +120,8 @@ MAX_QUEUED = 5
 
 ROW_SQL = (
     "SELECT jobs.*, t.markdown AS tailoring_md, tj.state AS tj_state, tj.pdf AS tj_pdf, "
-    "tj.warnings AS tj_warnings, tj.error AS tj_error, tj.requested AS tj_requested, tj.finished AS tj_finished "
+    "tj.warnings AS tj_warnings, tj.error AS tj_error, tj.requested AS tj_requested, tj.finished AS tj_finished, "
+    "tj.started AS tj_started "
     "FROM jobs LEFT JOIN tailoring t ON t.job_id = jobs.id LEFT JOIN tailor_jobs tj ON tj.job_id = jobs.id")
 
 
@@ -180,6 +181,26 @@ async def _request_tailor(body: TailorRequest, request: Request):
     return {"state": "queued"}
 
 
+class CancelRequest(BaseModel):
+    id: str
+
+
+@app.post("/api/tailor/cancel")
+async def cancel_tailor(body: CancelRequest, request: Request):
+    """Cancel a pending request (queued, or running with a dead or overdue worker) and restore the card."""
+    origin = request.headers.get("origin")
+    if origin and urlsplit(origin).netloc.lower() not in allowed_hosts():
+        return JSONResponse({"error": "bad origin"}, status_code=403)
+    try:
+        with db() as con:
+            cv.cancel_request(con, body.id)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=409)
+    except sqlite3.OperationalError as exc:
+        return busy(exc)
+    return {"state": "cancelled"}
+
+
 class DeleteVersions(BaseModel):
     id: str
     n: int | None = Field(default=None, ge=1, le=2**31 - 1)
@@ -222,9 +243,10 @@ def tailor_fragment(id: str):
     with db() as con:
         row = con.execute(f"{ROW_SQL} WHERE jobs.id = ?", (id,)).fetchone()
         vers = versions_for(con, [id]) if row else {}
+        age = radar.worker_age(con)
     if row is None:
         return HTMLResponse("", status_code=404)
-    return HTMLResponse(render_tailor(row, vers.get(id)))
+    return HTMLResponse(render_tailor(row, vers.get(id), age))
 
 
 FILE_NAME_RE = re.compile(r"\A[0-9a-f]{16}(\.v[1-9]\d{0,5})?\.(pdf|tex)\Z")  # current files and archived versions
@@ -629,17 +651,42 @@ def render_regen(r, versions: list | None) -> str:
             '<button type="button" class="btn primary" data-act="regen-go">Generate</button></div></details>')
 
 
-def render_tailor(r, versions: list | None = None) -> str:
+def pending_box(r, state: str, age: float | None, now: datetime | None = None) -> str:
+    """The card while a request is queued or running. `age` = seconds since the worker's last heartbeat (None = never).
+    Offline and slow states are shown as alerts with a Cancel button; time is injectable for tests."""
+    now = now or radar.utc_now()
+    since = radar.ts_parse(r["tj_started"] if state == "running" else None) or radar.ts_parse(r["tj_requested"])
+    elapsed = (now - since).total_seconds() if since else 0
+    requested = fmt_hm(r["tj_requested"])
+    cancel = '<button type="button" class="btn" data-act="tailor-cancel">Cancel request</button>'
+    if not radar.worker_online(age):
+        last = fmt_hm(radar.ts_str(now - timedelta(seconds=age))) if age is not None else ""
+        who = f"Worker offline since {last}" if last else "Worker offline"
+        return (f'<div class="box warnbox" role="alert" data-pending-kind="offline"><div class="frow">{icon("alert", 18)}<div>'
+                f"<strong>{who}.</strong><div class=\"small muted\">Your request will run as soon as it is back"
+                f"{' (requested ' + requested + ')' if requested else ''}. You can cancel it; nothing is lost.</div></div></div>{cancel}</div>")
+    # a running request is overdue (longer than any job should take, or its start time is unknown): the worker may be hung
+    # even though its heartbeat thread still beats, so it can be cancelled, exactly as cv.cancel_request allows
+    overdue = state == "running" and (not r["tj_started"] or elapsed > radar.RUNNING_STALE_SECONDS)
+    if elapsed > radar.SLOW_REQUEST_SECONDS or overdue:
+        where = "the request is still in the queue" if state == "queued" else "the worker is still on it"
+        return (f'<div class="box warnbox" role="alert" data-pending-kind="slow"><div class="frow">{icon("alert", 18)}<div>'
+                f"<strong>Taking longer than expected.</strong><div class=\"small muted\">It usually takes about a minute and has "
+                f"been {int(elapsed // 60)} minutes. The model may be busy; {where}.</div></div></div>"
+                f'{cancel if state == "queued" or overdue else ""}</div>')
+    what = "Waiting in the queue…" if state == "queued" else "Tailoring resume…"
+    return (f'<div class="box pend" role="status"><div class="prow"><span class="spin" aria-hidden="true"></span>'
+            f'<span>{what} <span class="muted">usually about a minute</span></span></div>'
+            f'<div class="bar"><i></i></div><span class="small muted">{"Started " + requested + " · " if requested else ""}'
+            "you can keep triaging; this card updates on its own.</span></div>")
+
+
+def render_tailor(r, versions: list | None = None, worker_age: float | None = None, now: datetime | None = None) -> str:
     """The tailor slot of a card (swapped in place by the page while a request is pending)."""
     state, token = r["tj_state"], radar.file_token(r["id"])
     box, idle = "", state is None
     if state in ("queued", "running"):
-        started = fmt_hm(r["tj_requested"])
-        what = "Waiting in the queue…" if state == "queued" else "Tailoring resume…"
-        box = (f'<div class="box pend" role="status"><div class="prow"><span class="spin" aria-hidden="true"></span>'
-               f'<span>{what} <span class="muted">usually about a minute</span></span></div>'
-               f'<div class="bar"><i></i></div><span class="small muted">{"Started " + started + " · " if started else ""}'
-               "you can keep triaging; this card updates on its own.</span></div>")
+        box = pending_box(r, state, worker_age, now)
     elif state == "failed":
         box = (f'<div class="box fail" role="alert"><div class="frow">{icon("xcircle", 18)}<div>'
                f'<strong>Couldn\'t tailor this resume.</strong><div class="mono">{e(r["tj_error"] or "unknown error")}</div>'
@@ -692,7 +739,7 @@ def seg(status: str) -> str:
     return f'<div class="seg" role="group" aria-label="Status">{"".join(btns)}</div>'
 
 
-def render_card(r, hidden: bool = False, versions: list | None = None) -> str:
+def render_card(r, hidden: bool = False, versions: list | None = None, worker_age: float | None = None) -> str:
     score, bnd = r["score"], band(r["score"])
     fs = parse_ts(r["first_seen"])
     fresh = r["status"] == "new" and fs is not None and datetime.now(BERLIN) - fs < timedelta(hours=48)
@@ -725,7 +772,7 @@ data-first="{e(r['first_seen'] or '', quote=True)}"{' hidden' if hidden else ''}
     <div class="meta">{where}<span>{e(r['source'] or '')}</span><span>{e(fmt_day(r['first_seen']))}</span></div>
     <p class="reason{' muted' if score is None else ''}">{e(reason)}</p>
     {cv_line}
-    {render_tailor(r, versions)}
+    {render_tailor(r, versions, worker_age)}
     {seg(r['status'])}
     {f'<div class="desc" hidden>{e(desc[:2000])}</div>' if desc else ''}
   </div>
@@ -824,6 +871,8 @@ main{padding:8px 16px 24px;display:flex;flex-direction:column;gap:12px}
 .hist .vl a{display:inline-flex;align-items:center;min-height:40px;padding:0 8px}
 .hist .vl .lnk{padding:0 8px;font-size:13px}.hist .del,.lnk.del{color:var(--danger)}.hist>.lnk.del{margin-top:4px}
 .tag.keep{background:var(--accent-tint);color:var(--accent-fg)}
+.box.warnbox{background:var(--warn-tint);border:1px solid var(--warn-line);border-radius:10px;padding:10px 12px;display:flex;flex-direction:column;gap:8px}
+.box.warnbox .btn{align-self:flex-start}
 .fit summary .gapcount{margin-left:8px;white-space:nowrap;flex-shrink:0;font-size:12px;font-weight:600;border-radius:999px;padding:1px 8px;background:var(--gap-tint);color:var(--gap-fg);border:1px solid var(--gap-line)}
 .md .lead{margin:0 0 6px;font-size:13px;color:var(--muted)}
 .fitsec h4{display:flex;align-items:center;gap:6px}.fitsec.gaps h4{color:var(--gap-fg)}
@@ -1000,6 +1049,14 @@ async function deleteVersions(c,payload,msg){
     say(j.deleted.length?('Deleted '+j.deleted.map(n=>'v'+n).join(', ')):'Nothing to delete');await refreshTailor(c);
   }catch(err){say('Could not delete: '+err.message);}
 }
+async function cancelTailor(c){
+  try{
+    const r=await fetch('/api/tailor/cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:c.dataset.id})});
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok){if(r.status===409)await refreshTailor(c);throw new Error(j.error||r.status);}  // the card catches up with the server
+    delete c.dataset.t0;delete c.dataset.slowTick;say('Request cancelled');await refreshTailor(c);
+  }catch(err){say('Could not cancel: '+err.message);}
+}
 function setKb(c){if(cur)cur.classList.remove('kb');cur=c;if(c){c.classList.add('kb');c.scrollIntoView({block:'nearest'});}}
 function move(d){
   const vis=cards().filter(c=>!c.hidden);if(!vis.length)return;
@@ -1020,6 +1077,7 @@ document.addEventListener('click',e=>{
       deleteVersions(c,{n:+d.n},'Delete version v'+d.n+(d.pinned==='1'?' (pinned: you labelled it to keep it)':'')+(d.cur==='1'?(d.prev==='1'?', your CURRENT resume? The previous version becomes current':', your only resume? The resume for this job will be removed'):'? ')+'. This cannot be undone.');}
     else if(a.dataset.act==='resume-delete-older'&&c)deleteVersions(c,{all_older:true},'Delete all older versions except the newest and the pinned ones? This cannot be undone.');
     else if(a.dataset.act==='undo')doUndo();
+    else if(a.dataset.act==='tailor-cancel'&&c)cancelTailor(c);
     else if(a.dataset.act==='view'){showView(a.dataset.view);toast.hidden=true;}
     else if(a.dataset.act==='details'&&c){const d=$('.desc',c),open=d.hidden;d.hidden=!open;a.setAttribute('aria-expanded',String(open));}
     else if(a.dataset.act==='more'){const o=more.classList.toggle('open');a.setAttribute('aria-expanded',String(o));}
@@ -1056,7 +1114,9 @@ setInterval(()=>{
   for(const c of $$('.card')){
     if(!$('.tailor[data-pending]',c))continue;
     const t0=+(c.dataset.t0||(c.dataset.t0=Date.now()));
-    if(Date.now()-t0<300000)refreshTailor(c);
+    // fast for the first 5 minutes, then every 20 s up to 30 minutes: the card keeps saying what is going on
+    const age=Date.now()-t0;
+    if(age<300000||(age<1800000&&(c.dataset.slowTick=(+(c.dataset.slowTick||0)+1)%5)===0))refreshTailor(c);
   }
 },4000);
 apply();
@@ -1104,6 +1164,7 @@ def index(request: Request, min_score: int = Query(0, ge=0, le=100), source: str
         run = last_run(con)
         gaps = gap_stats(con)
         vers = versions_for(con)
+        w_age = radar.worker_age(con)
         today = datetime.now(BERLIN).date()
         triaged = sum(1 for r in con.execute("SELECT status_at FROM jobs WHERE status != 'new' AND status_at IS NOT NULL")
                       if (parse_ts(r[0]) or datetime.min.replace(tzinfo=BERLIN)).date() == today)
@@ -1173,7 +1234,7 @@ def index(request: Request, min_score: int = Query(0, ge=0, le=100), source: str
 <div><span class="muted">Sources</span><span>{len(radar.SOURCE_NAMES)} configured</span></div>
 <div><span class="muted">Search radius</span><span>{radar.BA_RADIUS_KM} km of Darmstadt</span></div></div></div></main>"""
     else:
-        cards = "".join(render_card(r, hidden=not visible(r), versions=vers.get(r["id"])) for r in rows)
+        cards = "".join(render_card(r, hidden=not visible(r), versions=vers.get(r["id"]), worker_age=w_age) for r in rows)
         main = f"""<main><div id="list" data-total="{total}" data-triaged="{triaged}">{cards}</div>
 <div class="empty" id="empty" hidden><h2></h2><p></p><div class="acts"></div></div>
 <p class="endmsg">That's all for today. Next run {e(nxt)}.</p></main>"""

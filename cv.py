@@ -407,6 +407,42 @@ def set_label(db: sqlite3.Connection, job_id: str, n: int, label: str) -> None:
     db.commit()
 
 
+def cancel_request(db: sqlite3.Connection, job_id: str, now: datetime | None = None) -> str:
+    """Cancel a pending tailor request and put the card back as it was: the newest archived resume again, or idle when
+    there is none. Allowed while the request is queued, or running with a worker that is offline or long past its time;
+    refused while a live worker is on it (it cannot be interrupted safely). Returns 'cancelled'."""
+    now = now or radar.utc_now()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        row = db.execute("SELECT state, started FROM tailor_jobs WHERE job_id = ?", (job_id,)).fetchone()
+        if row is None or row["state"] not in ("queued", "running"):
+            raise ValueError("there is no pending request for this job")
+        if row["state"] == "running":
+            started = radar.ts_parse(row["started"])
+            overdue = started is None or (now - started).total_seconds() > radar.RUNNING_STALE_SECONDS
+            if radar.worker_online(radar.worker_age(db, now)) and not overdue:
+                raise ValueError("the worker is on it right now: wait for it to finish")
+        prev = db.execute("SELECT created, pdf, warnings FROM resume_versions WHERE job_id = ? ORDER BY n DESC LIMIT 1",
+                          (job_id,)).fetchone()
+        if prev is not None:
+            db.execute("UPDATE tailor_jobs SET state = 'done', error = NULL, started = NULL, finished = ?, pdf = ?, warnings = ? "
+                       "WHERE job_id = ?", (prev["created"], prev["pdf"], prev["warnings"], job_id))
+        else:
+            token = radar.file_token(job_id)
+            tex = radar.TAILORED_DIR / f"{token}.tex"
+            if tex.exists():  # a resume from before versions were tracked: put the card back on it instead of hiding it
+                made = datetime.fromtimestamp(tex.stat().st_mtime, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                db.execute("UPDATE tailor_jobs SET state = 'done', error = NULL, started = NULL, finished = ?, pdf = ?, warnings = '[]' "
+                           "WHERE job_id = ?", (made, int((radar.TAILORED_DIR / f"{token}.pdf").exists()), job_id))
+            else:
+                db.execute("DELETE FROM tailor_jobs WHERE job_id = ?", (job_id,))
+        db.commit()
+    except BaseException:
+        db.rollback()
+        raise
+    return "cancelled"
+
+
 def _stage_copy(src: Path, directory: Path) -> Path:
     """Copy `src` to a private temp file in `directory` and return its path (the caller renames it into place)."""
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".stage.")

@@ -8,6 +8,7 @@ import json
 import signal
 import sqlite3
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -17,6 +18,7 @@ import cv
 import radar
 
 POLL_SECONDS = 3
+HEARTBEAT_SECONDS = 10
 _stop = False
 
 
@@ -30,8 +32,8 @@ def claim(db: sqlite3.Connection) -> str | None:
     row = db.execute("SELECT job_id FROM tailor_jobs WHERE state = 'queued' ORDER BY requested LIMIT 1").fetchone()
     if row is None:
         return None
-    cur = db.execute("UPDATE tailor_jobs SET state = 'running', error = NULL WHERE job_id = ? AND state = 'queued'",
-                     (row["job_id"],))
+    cur = db.execute("UPDATE tailor_jobs SET state = 'running', error = NULL, started = CURRENT_TIMESTAMP "
+                     "WHERE job_id = ? AND state = 'queued'", (row["job_id"],))
     db.commit()
     return row["job_id"] if cur.rowcount else None
 
@@ -43,20 +45,53 @@ def finish(db: sqlite3.Connection, job_id: str, state: str, pdf: int = 0, warnin
     db.commit()
 
 
+def heartbeat_loop(stop: threading.Event) -> None:
+    """Report 'alive' every few seconds from a separate connection, so a long tailoring job (up to ~10 minutes) never
+    makes the dashboard think the worker is offline. A locked database (when opening it or when writing) only costs one
+    beat: the thread retries on the next tick instead of dying."""
+    con = None
+    try:
+        while not stop.is_set():
+            try:
+                if con is None:
+                    con = radar.open_db()
+                radar.beat(con)
+            except sqlite3.OperationalError:
+                if con is not None:
+                    try:
+                        con.rollback()
+                    except sqlite3.Error:
+                        pass
+            stop.wait(HEARTBEAT_SECONDS)
+    finally:
+        if con is not None:
+            con.close()
+
+
+def startup(db: sqlite3.Connection) -> None:
+    """Before the first job is claimed: report alive at once (a Cancel clicked on a stale 'offline' card must not slip
+    in right after a claim) and put requests that a crash left 'running' back in the queue."""
+    radar.beat(db)
+    db.execute("UPDATE tailor_jobs SET state = 'queued', started = NULL WHERE state = 'running'")
+    db.commit()
+
+
 def main() -> int:
     radar.load_env()
     db = radar.open_db()
-    # A crash or restart mid-job leaves 'running' rows behind: put them back in the queue.
-    db.execute("UPDATE tailor_jobs SET state = 'queued' WHERE state = 'running'")
-    db.commit()
+    stop_beat = threading.Event()
+    threading.Thread(target=heartbeat_loop, args=(stop_beat,), daemon=True, name="heartbeat").start()
+    startup(db)  # beat first, then re-queue whatever a crash left 'running'
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
     radar.log("tailor worker started")
     while not _stop:
+        for stale in radar.requeue_stale(db):
+            radar.log(f"requeued {stale}: it was 'running' for more than {radar.RUNNING_STALE_SECONDS} s")
         job_id = claim(db)
         if job_id is None:
             time.sleep(POLL_SECONDS)
-            continue
+            continue  # the heartbeat thread keeps reporting meanwhile
         radar.log(f"tailoring {job_id}")
         try:
             req = db.execute("SELECT notes, base_n, label FROM tailor_jobs WHERE job_id = ?", (job_id,)).fetchone()
@@ -68,6 +103,7 @@ def main() -> int:
         except Exception as e:  # one bad job must not stop the worker
             finish(db, job_id, "failed", error=str(e)[:300])
             radar.log(f"failed {job_id}: {e!r}")
+    stop_beat.set()
     return 0
 
 
