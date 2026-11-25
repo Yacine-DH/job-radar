@@ -20,7 +20,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from html.parser import HTMLParser
 from pathlib import Path
@@ -539,16 +539,25 @@ def requeue_stale(db: sqlite3.Connection, now: datetime | None = None, limit: in
     """Put 'running' requests that started more than `limit` seconds ago back in the queue (a crashed or hung worker
     never finished them). Requests without a start time are left alone."""
     now = now or utc_now()
-    stale = []
-    for r in db.execute("SELECT job_id, started FROM tailor_jobs WHERE state = 'running'").fetchall():
-        started = ts_parse(r["started"])
-        if started is not None and (now - started).total_seconds() > limit:
-            stale.append(r["job_id"])
-    for job_id in stale:
-        db.execute("UPDATE tailor_jobs SET state = 'queued', started = NULL WHERE job_id = ? AND state = 'running'", (job_id,))
-    if stale:
+    cutoff = ts_str(now - timedelta(seconds=limit))
+    candidates = [r["job_id"] for r in db.execute(
+        "SELECT job_id FROM tailor_jobs WHERE state = 'running' AND started IS NOT NULL AND started < ?", (cutoff,))]
+    if not candidates:  # the common case: no write lock needed
+        return []
+    requeued = []
+    try:
+        for job_id in candidates:
+            # each UPDATE re-checks state and start time itself: a request that was cancelled, finished or restarted since
+            # the read above no longer matches and is left alone (rowcount 0, so it is not reported either)
+            cur = db.execute("UPDATE tailor_jobs SET state = 'queued', started = NULL "
+                             "WHERE job_id = ? AND state = 'running' AND started IS NOT NULL AND started < ?", (job_id, cutoff))
+            if cur.rowcount:
+                requeued.append(job_id)
         db.commit()
-    return stale
+    except BaseException:
+        db.rollback()
+        raise
+    return requeued
 
 
 SYSTEM_PROMPT = (

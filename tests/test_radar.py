@@ -112,6 +112,56 @@ class WorkerQueueTests(unittest.TestCase):
         self.assertEqual(self.state("e")[0], "done")
         self.assertEqual(radar.requeue_stale(self.db, self.T0), [])           # idempotent
 
+    def test_a_request_restarted_between_the_check_and_the_update_is_not_requeued(self):
+        self.add("a", "running", self.at(-radar.RUNNING_STALE_SECONDS - 100))
+        racer = self
+
+        class Racing:
+            """Lets a fresh start of the same request happen right before requeue_stale's UPDATE."""
+            def __init__(self, inner):
+                self.inner, self.done = inner, False
+
+            def execute(self, sql, *args):
+                if sql.lstrip().startswith("UPDATE tailor_jobs SET state = 'queued'") and not self.done:
+                    self.done = True
+                    self.inner.execute("UPDATE tailor_jobs SET started = ? WHERE job_id = 'a'", (radar.ts_str(racer.T0),))
+                return self.inner.execute(sql, *args)
+
+            def commit(self):
+                return self.inner.commit()
+
+            def rollback(self):
+                return self.inner.rollback()
+
+        self.assertEqual(radar.requeue_stale(Racing(self.db), self.T0), [])
+        self.assertEqual(self.state("a")[0], "running")
+
+    def test_requeue_waits_for_the_write_lock_when_there_is_work_and_leaves_nothing_half_done(self):
+        import sqlite3
+        self.add("a", "running", self.at(-radar.RUNNING_STALE_SECONDS - 1))
+        other = radar.open_db()
+        try:
+            other.execute("BEGIN IMMEDIATE")                             # another writer is active
+            self.db.execute("PRAGMA busy_timeout = 50")
+            with self.assertRaises(sqlite3.OperationalError):
+                radar.requeue_stale(self.db, self.T0)
+        finally:
+            other.rollback()
+            other.close()
+        self.assertFalse(self.db.in_transaction)
+        self.assertEqual(self.state("a")[0], "running")
+        self.assertEqual(radar.requeue_stale(self.db, self.T0), ["a"])   # and works once the lock is free
+
+    def test_requeue_takes_no_write_lock_when_nothing_is_overdue(self):
+        self.add("a", "running", self.at(-10))
+        other = radar.open_db()
+        try:
+            other.execute("BEGIN IMMEDIATE")                             # another writer is active
+            self.assertEqual(radar.requeue_stale(self.db, self.T0), [])  # nothing to do: no lock needed, no error
+        finally:
+            other.rollback()
+            other.close()
+
     def test_an_old_database_gains_meta_and_started(self):
         import tempfile
         from pathlib import Path

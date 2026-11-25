@@ -428,7 +428,14 @@ def cancel_request(db: sqlite3.Connection, job_id: str, now: datetime | None = N
             db.execute("UPDATE tailor_jobs SET state = 'done', error = NULL, started = NULL, finished = ?, pdf = ?, warnings = ? "
                        "WHERE job_id = ?", (prev["created"], prev["pdf"], prev["warnings"], job_id))
         else:
-            db.execute("DELETE FROM tailor_jobs WHERE job_id = ?", (job_id,))
+            token = radar.file_token(job_id)
+            tex = radar.TAILORED_DIR / f"{token}.tex"
+            if tex.exists():  # a resume from before versions were tracked: put the card back on it instead of hiding it
+                made = datetime.fromtimestamp(tex.stat().st_mtime, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                db.execute("UPDATE tailor_jobs SET state = 'done', error = NULL, started = NULL, finished = ?, pdf = ?, warnings = '[]' "
+                           "WHERE job_id = ?", (made, int((radar.TAILORED_DIR / f"{token}.pdf").exists()), job_id))
+            else:
+                db.execute("DELETE FROM tailor_jobs WHERE job_id = ?", (job_id,))
         db.commit()
     except BaseException:
         db.rollback()

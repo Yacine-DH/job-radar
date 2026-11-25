@@ -665,11 +665,15 @@ def pending_box(r, state: str, age: float | None, now: datetime | None = None) -
         return (f'<div class="box warnbox" role="alert" data-pending-kind="offline"><div class="frow">{icon("alert", 18)}<div>'
                 f"<strong>{who}.</strong><div class=\"small muted\">Your request will run as soon as it is back"
                 f"{' (requested ' + requested + ')' if requested else ''}. You can cancel it; nothing is lost.</div></div></div>{cancel}</div>")
-    if elapsed > radar.SLOW_REQUEST_SECONDS:
+    # a running request is overdue (longer than any job should take, or its start time is unknown): the worker may be hung
+    # even though its heartbeat thread still beats, so it can be cancelled, exactly as cv.cancel_request allows
+    overdue = state == "running" and (not r["tj_started"] or elapsed > radar.RUNNING_STALE_SECONDS)
+    if elapsed > radar.SLOW_REQUEST_SECONDS or overdue:
+        where = "the request is still in the queue" if state == "queued" else "the worker is still on it"
         return (f'<div class="box warnbox" role="alert" data-pending-kind="slow"><div class="frow">{icon("alert", 18)}<div>'
                 f"<strong>Taking longer than expected.</strong><div class=\"small muted\">It usually takes about a minute and has "
-                f"been {int(elapsed // 60)} minutes. The model may be busy; the request is still in the queue.</div></div></div>"
-                f'{cancel if state == "queued" else ""}</div>')
+                f"been {int(elapsed // 60)} minutes. The model may be busy; {where}.</div></div></div>"
+                f'{cancel if state == "queued" or overdue else ""}</div>')
     what = "Waiting in the queue…" if state == "queued" else "Tailoring resume…"
     return (f'<div class="box pend" role="status"><div class="prow"><span class="spin" aria-hidden="true"></span>'
             f'<span>{what} <span class="muted">usually about a minute</span></span></div>'
@@ -1048,8 +1052,9 @@ async function deleteVersions(c,payload,msg){
 async function cancelTailor(c){
   try{
     const r=await fetch('/api/tailor/cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:c.dataset.id})});
-    const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||r.status);
-    delete c.dataset.t0;say('Request cancelled');await refreshTailor(c);
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok){if(r.status===409)await refreshTailor(c);throw new Error(j.error||r.status);}  // the card catches up with the server
+    delete c.dataset.t0;delete c.dataset.slowTick;say('Request cancelled');await refreshTailor(c);
   }catch(err){say('Could not cancel: '+err.message);}
 }
 function setKb(c){if(cur)cur.classList.remove('kb');cur=c;if(c){c.classList.add('kb');c.scrollIntoView({block:'nearest'});}}

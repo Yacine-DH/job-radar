@@ -47,5 +47,52 @@ class WorkerTests(unittest.TestCase):
         self.assertFalse(t.is_alive())
 
 
+    def test_startup_beats_before_anything_is_claimed_and_clears_crashed_rows(self):
+        self.db.execute("INSERT INTO tailor_jobs (job_id, state, started) VALUES ('t:1', 'running', '2026-11-16 08:00:00')")
+        self.db.commit()
+        self.assertIsNone(radar.worker_age(self.db))
+        worker.startup(self.db)
+        self.assertTrue(radar.worker_online(radar.worker_age(self.db)))     # a heartbeat exists before the first claim
+        row = self.db.execute("SELECT state, started FROM tailor_jobs").fetchone()
+        self.assertEqual((row["state"], row["started"]), ("queued", None))
+
+    def test_the_heartbeat_thread_survives_a_locked_database_when_opening_and_when_writing(self):
+        import sqlite3
+        from unittest import mock
+        real_open, real_beat = radar.open_db, radar.beat
+        calls = {"open": 0, "beat": 0}
+
+        def flaky_open():
+            calls["open"] += 1
+            if calls["open"] == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return real_open()
+
+        def flaky_beat(con, now=None):
+            calls["beat"] += 1
+            if calls["beat"] == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return real_beat(con, now)
+
+        stop = threading.Event()
+        old = worker.HEARTBEAT_SECONDS
+        worker.HEARTBEAT_SECONDS = 0.05
+        t = threading.Thread(target=worker.heartbeat_loop, args=(stop,), daemon=True)
+        try:
+            with mock.patch.object(radar, "open_db", flaky_open), mock.patch.object(radar, "beat", flaky_beat):
+                t.start()
+                deadline = time.time() + 5
+                while radar.worker_age(self.db) is None and time.time() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(t.is_alive(), "the heartbeat thread died")
+        finally:
+            stop.set()
+            t.join(timeout=5)
+            worker.HEARTBEAT_SECONDS = old
+        self.assertIsNotNone(radar.worker_age(self.db), "it never recovered")
+        self.assertGreaterEqual(calls["open"], 2)
+        self.assertGreaterEqual(calls["beat"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()

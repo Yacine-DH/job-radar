@@ -63,7 +63,7 @@ class RenderingTests(unittest.TestCase):
         self.assertIn('data-state="idle"', idle)
         self.assertIn("Tailor resume", idle)
         now = datetime(2026, 11, 16, 8, 14, tzinfo=d.timezone.utc)
-        pending = d.render_tailor(Row(base, tj_state="running", tj_requested="2026-11-16 08:13:00"), None, 5.0, now)
+        pending = d.render_tailor(Row(base, tj_state="running", tj_requested="2026-11-16 08:13:00", tj_started="2026-11-16 08:13:05"), None, 5.0, now)
         self.assertIn("data-pending", pending)
         self.assertIn('role="status"', pending)
         failed = d.render_tailor(Row(base, tj_state="failed", tj_error="<boom>"))
@@ -476,6 +476,27 @@ class RouteTests(unittest.TestCase):
             con.close()
         self.assertEqual(self.call(d.cancel_tailor, d.CancelRequest(id="t:1"))[0], 409)       # nothing pending any more
 
+    def test_cancel_route_returns_503_on_a_locked_database(self):
+        from unittest import mock
+        with mock.patch.object(d.cv, "cancel_request", side_effect=sqlite3.OperationalError("database is locked")):
+            self.assertEqual(self.call(d.cancel_tailor, d.CancelRequest(id="t:1"))[0], 503)
+
+    def test_the_fragment_reads_the_worker_heartbeat_from_the_database(self):
+        con = sqlite3.connect(radar.DB_PATH)
+        con.execute("INSERT INTO tailor_jobs (job_id, state, requested) VALUES ('t:1', 'queued', ?)", (radar.ts_str(radar.utc_now()),))
+        con.commit()
+        con.close()
+        offline = d.tailor_fragment("t:1").body.decode()
+        self.assertIn('data-pending-kind="offline"', offline)               # no heartbeat yet
+        con = sqlite3.connect(radar.DB_PATH)
+        try:
+            radar.beat(con)
+        finally:
+            con.close()
+        online = d.tailor_fragment("t:1").body.decode()
+        self.assertNotIn("offline", online.lower())
+        self.assertIn('role="status"', online)
+
     def test_a_locked_database_is_a_503_not_a_crash(self):
         from unittest import mock
         err = sqlite3.OperationalError("database is locked")
@@ -558,6 +579,19 @@ class PendingStatesTests(unittest.TestCase):
 
     def test_a_slow_running_request_has_no_cancel_while_a_live_worker_is_on_it(self):
         h = self.box("running", requested="2026-11-16 11:40:00", started="2026-11-16 11:50:00")
+        self.assertIn("Taking longer than expected", h)
+        self.assertNotIn("tailor-cancel", h)
+
+    def test_an_overdue_running_request_can_be_cancelled_even_with_a_live_worker(self):
+        h = self.box("running", requested="2026-11-16 11:30:00", started="2026-11-16 11:40:00")       # 20 minutes running
+        self.assertIn("tailor-cancel", h)
+        self.assertIn("the worker is still on it", h)
+        self.assertNotIn("still in the queue", h)
+        h = self.box("running", requested="2026-11-16 11:50:00", started=None)                      # start time unknown
+        self.assertIn("tailor-cancel", h)
+
+    def test_a_running_request_within_its_time_has_no_cancel(self):
+        h = self.box("running", requested="2026-11-16 11:40:00", started="2026-11-16 11:50:00")       # slow (10 min) but not overdue
         self.assertIn("Taking longer than expected", h)
         self.assertNotIn("tailor-cancel", h)
 

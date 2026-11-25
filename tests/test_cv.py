@@ -436,6 +436,52 @@ class CancelRequestTests(unittest.TestCase):
         cv.cancel_request(self.db, self.job, self.NOW)
         self.assertIsNone(self.row())
 
+    def test_cancelling_restores_a_resume_that_predates_versions_instead_of_hiding_it(self):
+        import tempfile
+        from pathlib import Path
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        old = radar.TAILORED_DIR
+        self.addCleanup(setattr, radar, "TAILORED_DIR", old)
+        radar.TAILORED_DIR = Path(tmp.name)
+        token = radar.file_token(self.job)
+        (radar.TAILORED_DIR / f"{token}.tex").write_text("x")
+        (radar.TAILORED_DIR / f"{token}.pdf").write_bytes(b"%PDF")
+        self.pending("queued")                                           # no resume_versions rows at all
+        cv.cancel_request(self.db, self.job, self.NOW)
+        r = self.row()
+        self.assertEqual((r["state"], r["pdf"], r["warnings"], r["error"]), ("done", 1, "[]", None))
+        self.assertIsNone(self.db.execute("SELECT started FROM tailor_jobs").fetchone()[0])
+        (radar.TAILORED_DIR / f"{token}.pdf").unlink()                   # a .tex alone: restored without a PDF
+        self.pending("queued")
+        cv.cancel_request(self.db, self.job, self.NOW)
+        self.assertEqual(self.row()["pdf"], 0)
+
+    def test_started_is_cleared_when_the_previous_resume_is_restored(self):
+        self.db.execute("INSERT INTO resume_versions (job_id, n, created, pdf) VALUES (?, 1, '2026-11-01 09:00:00', 1)", (self.job,))
+        self.pending("running", self.NOW - timedelta(seconds=radar.RUNNING_STALE_SECONDS + 5))
+        cv.cancel_request(self.db, self.job, self.NOW)
+        self.assertIsNone(self.db.execute("SELECT started FROM tailor_jobs").fetchone()[0])
+
+    def test_the_overdue_boundary(self):
+        radar.beat(self.db, self.NOW)                                    # a live worker ...
+        self.pending("running", self.NOW - timedelta(seconds=radar.RUNNING_STALE_SECONDS))   # ... exactly at the limit: not overdue
+        with self.assertRaises(ValueError):
+            cv.cancel_request(self.db, self.job, self.NOW)
+        self.assertEqual(self.row()["state"], "running")
+        later = self.NOW + timedelta(seconds=1)                          # one second past the limit: overdue
+        radar.beat(self.db, later)
+        cv.cancel_request(self.db, self.job, later)
+        self.assertIsNone(self.row())
+
+    def test_a_heartbeat_just_past_the_stale_limit_means_offline(self):
+        radar.beat(self.db, self.NOW)
+        self.pending("running", self.NOW)                                # a fresh request
+        with self.assertRaises(ValueError):                              # last beat 45 s ago: still online
+            cv.cancel_request(self.db, self.job, self.NOW + timedelta(seconds=radar.WORKER_STALE_SECONDS))
+        cv.cancel_request(self.db, self.job, self.NOW + timedelta(seconds=radar.WORKER_STALE_SECONDS + 1))   # 46 s: offline
+        self.assertIsNone(self.row())
+
     def test_nothing_pending_is_an_error_and_done_requests_are_untouched(self):
         with self.assertRaises(ValueError):
             cv.cancel_request(self.db, self.job, self.NOW)

@@ -47,17 +47,33 @@ def finish(db: sqlite3.Connection, job_id: str, state: str, pdf: int = 0, warnin
 
 def heartbeat_loop(stop: threading.Event) -> None:
     """Report 'alive' every few seconds from a separate connection, so a long tailoring job (up to ~10 minutes) never
-    makes the dashboard think the worker is offline."""
-    con = radar.open_db()
+    makes the dashboard think the worker is offline. A locked database (when opening it or when writing) only costs one
+    beat: the thread retries on the next tick instead of dying."""
+    con = None
     try:
         while not stop.is_set():
             try:
+                if con is None:
+                    con = radar.open_db()
                 radar.beat(con)
-            except sqlite3.OperationalError:  # database busy: the next beat will do
-                pass
+            except sqlite3.OperationalError:
+                if con is not None:
+                    try:
+                        con.rollback()
+                    except sqlite3.Error:
+                        pass
             stop.wait(HEARTBEAT_SECONDS)
     finally:
-        con.close()
+        if con is not None:
+            con.close()
+
+
+def startup(db: sqlite3.Connection) -> None:
+    """Before the first job is claimed: report alive at once (a Cancel clicked on a stale 'offline' card must not slip
+    in right after a claim) and put requests that a crash left 'running' back in the queue."""
+    radar.beat(db)
+    db.execute("UPDATE tailor_jobs SET state = 'queued', started = NULL WHERE state = 'running'")
+    db.commit()
 
 
 def main() -> int:
@@ -65,9 +81,7 @@ def main() -> int:
     db = radar.open_db()
     stop_beat = threading.Event()
     threading.Thread(target=heartbeat_loop, args=(stop_beat,), daemon=True, name="heartbeat").start()
-    # A crash or restart mid-job leaves 'running' rows behind: put them back in the queue.
-    db.execute("UPDATE tailor_jobs SET state = 'queued' WHERE state = 'running'")
-    db.commit()
+    startup(db)  # beat first, then re-queue whatever a crash left 'running'
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
     radar.log("tailor worker started")
