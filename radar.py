@@ -487,8 +487,12 @@ def city_key(location: str | None) -> str:
     "64283 Darmstadt" -> "darmstadt", "(Remote) Berlin" -> "berlin", "Frankfurt am Main" / "Frankfurt/Main" /
     "Frankfurt (Main)" -> "frankfurt". Empty when unknown."""
     text = (location or "").lower()
-    text = re.sub(r"^\s*(?:d-)?[0-9]{5}\s+", "", text)           # postal code prefix
-    text = re.sub(r"^(?:\s*\([^)]*\))+\s*", "", text)            # leading tags such as "(Remote)" or "(Hybrid)"
+    for _ in range(3):  # tags and a postal code can come in either order: "(Remote) 64283 Darmstadt", "64283 (Remote) Darmstadt"
+        stripped = re.sub(r"^(?:\s*\([^)]*\)\s*[,;/|-]?)+\s*", "", text)      # leading tags such as "(Remote)" or "(Hybrid) /"
+        stripped = re.sub(r"^\s*(?:d-)?[0-9]{5}\s+", "", stripped)             # postal code prefix
+        if stripped == text:
+            break
+        text = stripped
     first = re.split(r"[,;/|(]", text, maxsplit=1)[0]
     city = re.sub(r"\s+", " ", _TITLE_NOISE.sub(" ", first)).strip()
     return re.sub(r"\s+(?:am|a)\s+m(?:ain)?$", "", city)         # "frankfurt am main" / "frankfurt a m" -> "frankfurt"
@@ -536,8 +540,9 @@ def store_new(db: sqlite3.Connection, jobs: list[dict]) -> None:
                 log(f"duplicate posting dropped: {j['id']} {j['title']!r} @ {j['company']!r} ({city or 'no city'}) matches {match[0]}")
                 if city and not match[1]:
                     match[1] = city
-                    db.execute("UPDATE jobs SET location = ?, distance_km = COALESCE(distance_km, ?) "
-                               "WHERE id = ? AND COALESCE(location, '') = ''", (j.get("location"), j.get("distance_km"), match[0]))
+                    # the stored location has no usable city (empty, or a tag such as "(Remote)"): the matching posting names it
+                    db.execute("UPDATE jobs SET location = ?, distance_km = COALESCE(distance_km, ?) WHERE id = ?",
+                               (j.get("location"), j.get("distance_km"), match[0]))
                 _add_also_on(db, match[0], j.get("source", ""))
                 continue
             known.setdefault(key, []).append([j["id"], city])

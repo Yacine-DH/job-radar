@@ -132,6 +132,15 @@ class DedupeByCityTests(unittest.TestCase):
         row = self.db.execute("SELECT location, distance_km FROM jobs WHERE id = 'an:1'").fetchone()
         self.assertEqual((row["location"], row["distance_km"]), ("Darmstadt", 1.0))               # filled in from the match
 
+    def test_a_stored_location_that_is_only_a_tag_is_claimed_too_and_does_not_swallow_later_cities(self):
+        radar.store_new(self.db, [{**self.JOB, "id": "an:1", "source": "Arbeitnow", "location": "(Remote)", "distance_km": None}])
+        radar.store_new(self.db, [{**self.JOB, "id": "ba:2", "location": "Darmstadt"}])           # claims it
+        row = self.db.execute("SELECT location, distance_km FROM jobs WHERE id = 'an:1'").fetchone()
+        self.assertEqual((row["location"], row["distance_km"]), ("Darmstadt", 1.0))
+        radar.store_new(self.db, [{**self.JOB, "id": "ba:3", "location": "Frankfurt am Main"}])   # next run, other city: kept
+        radar.store_new(self.db, [{**self.JOB, "id": "ba:4", "location": "Mainz"}])
+        self.assertEqual(self.ids(), ["an:1", "ba:3", "ba:4"])
+
     def test_an_exact_city_match_beats_a_cityless_one_regardless_of_order(self):
         # rows that already exist in the database: a cityless one stored FIRST, then one with a city
         for job_id, city in (("a:1", ""), ("a:2", "Mainz")):
@@ -176,6 +185,11 @@ class DedupeByCityTests(unittest.TestCase):
         self.assertEqual(radar.city_key("(Remote) Berlin"), "berlin")
         self.assertEqual(radar.city_key("(Hybrid)(Remote) Darmstadt"), "darmstadt")
         self.assertEqual(radar.city_key("(Remote)"), "")
+        self.assertEqual(radar.city_key("(Remote) 64283 Darmstadt"), "darmstadt")          # tag before the postal code
+        self.assertEqual(radar.city_key("64283 (Remote) Darmstadt"), "darmstadt")          # postal code before the tag
+        self.assertEqual(radar.city_key("(Remote), Berlin"), "berlin")                    # separator after the tag
+        self.assertEqual(radar.city_key("(Hybrid) / Darmstadt"), "darmstadt")
+        self.assertEqual(radar.city_key(", Hessen"), "")
         for variant in ("Frankfurt am Main", "Frankfurt/Main", "Frankfurt (Main)", "Frankfurt a. M.", "60311 Frankfurt am Main, Hessen"):
             self.assertEqual(radar.city_key(variant), "frankfurt", variant)
         self.assertEqual(radar.city_key("Offenbach am Main"), "offenbach")
