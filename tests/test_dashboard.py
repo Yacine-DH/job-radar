@@ -508,6 +508,12 @@ class DownloadNameTests(unittest.TestCase):
         self.assertEqual(d.slug("Straße (m/w/d) – IT", 40), "Strasse-m-w-d-IT")
         self.assertEqual(d.slug("Café Ünal", 40), "Cafe-Uenal")
 
+    def test_decomposed_umlauts_and_the_capital_sharp_s(self):
+        self.assertEqual(d.slug("Mu\u0308ller", 40), "Mueller")        # u + combining diaeresis (macOS, PDF, scraped feeds)
+        self.assertEqual(d.slug("Sch\u00f6n\u0308", 40), "Schoen")      # already-composed o-umlaut plus a stray mark
+        self.assertEqual(d.slug("STRA\u1e9eE", 40), "STRASSE")
+        self.assertEqual(d.slug("Stra\u00dfe", 40), "Strasse")
+
     def test_slug_is_limited_at_a_word_boundary_and_never_empty_handed(self):
         words = "Werkstudent Softwareentwicklung Python Backend"
         self.assertEqual(d.slug(words, 31), "Werkstudent-Softwareentwicklung")   # exactly 31 characters fits
@@ -526,6 +532,12 @@ class DownloadNameTests(unittest.TestCase):
         self.assertEqual(d.download_name("", "Werkstudent", f"{self.TOKEN}.pdf"), "Resume_Werkstudent.pdf")
         self.assertEqual(d.download_name(None, None, f"{self.TOKEN}.pdf"), "Resume.pdf")
         self.assertEqual(d.download_name("A", "B", "../evil.pdf"), "resume-../evil.pdf")  # never reached: the route 404s first
+
+    def test_non_ascii_digits_are_not_version_numbers(self):
+        for digits in ("\u0662", "\uff12", "1\u0662"):                       # Arabic-Indic, fullwidth, mixed
+            name = f"{self.TOKEN}.v{digits}.pdf"
+            self.assertEqual(d.download_name("A", "B", name), f"resume-{name}", digits)   # not parsed as a version
+            self.assertIsNone(d.FILE_NAME_RE.match(name), digits)                         # and refused by the whitelist
 
     def test_the_result_is_always_a_safe_ascii_filename(self):
         for company, title in (('Evil"; filename="x', "a\r\nSet-Cookie: x=1"), ("../../etc", "passwd\x00"), ("日本語", "テスト")):
@@ -581,6 +593,16 @@ class DownloadRouteTests(unittest.TestCase):
     def test_an_unknown_job_keeps_the_old_name(self):
         res = self.get("a" * 16 + ".pdf")
         self.assertIn('filename="resume-' + "a" * 16 + '.pdf"', res.headers["content-disposition"])
+
+    def test_a_locked_database_falls_back_to_the_plain_name_instead_of_a_500(self):
+        from unittest import mock
+        with mock.patch.object(d, "db", side_effect=sqlite3.OperationalError("database is locked")):
+            res = d.download(self.token + ".pdf")
+        self.assertEqual(res.status_code, 200)
+        self.assertIn(f'filename="resume-{self.token}.pdf"', res.headers["content-disposition"])
+
+    def test_unicode_digit_versions_are_404_in_the_route(self):
+        self.assertEqual(self.get(self.token + ".v\u0662.pdf").status_code, 404)
 
     def test_path_traversal_and_odd_names_still_404(self):
         for bad in ("../" + self.token + ".pdf", self.token + ".pdf/../x", "%2e%2e%2f" + self.token + ".pdf", self.token + ".exe",

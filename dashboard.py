@@ -228,17 +228,18 @@ def tailor_fragment(id: str):
     return HTMLResponse(render_tailor(row, vers.get(id)))
 
 
-FILE_NAME_RE = re.compile(r"\A[0-9a-f]{16}(\.v[1-9]\d{0,5})?\.(pdf|tex)\Z")  # current files and archived versions
+FILE_NAME_RE = re.compile(r"\A[0-9a-f]{16}(\.v[1-9][0-9]{0,5})?\.(pdf|tex)\Z")  # current files and archived versions
 
 
-_UMLAUTS = str.maketrans({"ä": "ae", "ö": "oe", "ü": "ue", "Ä": "Ae", "Ö": "Oe", "Ü": "Ue", "ß": "ss"})
-_FILE_PARTS_RE = re.compile(r"\A([0-9a-f]{16})(?:\.v([1-9]\d{0,5}))?\.(pdf|tex)\Z")
+_UMLAUTS = str.maketrans({"ä": "ae", "ö": "oe", "ü": "ue", "Ä": "Ae", "Ö": "Oe", "Ü": "Ue", "ß": "ss", "ẞ": "SS"})
+_FILE_PARTS_RE = re.compile(r"\A([0-9a-f]{16})(?:\.v([1-9][0-9]{0,5}))?\.(pdf|tex)\Z")
 
 
 def slug(text: str | None, limit: int) -> str:
     """ASCII words joined by '-', at most `limit` characters: German umlauts become ae/oe/ue/ss, '&' and other
     punctuation are dropped, long text is cut at a word boundary."""
-    t = unicodedata.normalize("NFKD", (text or "").translate(_UMLAUTS)).encode("ascii", "ignore").decode()
+    t = unicodedata.normalize("NFC", text or "").translate(_UMLAUTS)  # composed first, so "u" + combining diaeresis becomes "ü"
+    t = unicodedata.normalize("NFKD", t).encode("ascii", "ignore").decode()
     out: list[str] = []
     used = 0
     for w in re.findall(r"[A-Za-z0-9]+", t):
@@ -273,8 +274,11 @@ def download(name: str):
         return JSONResponse({"error": "not found"}, status_code=404)
     media = "application/pdf" if name.endswith(".pdf") else "text/plain; charset=utf-8"
     token = name[:16]
-    with db() as con:
-        job = next((r for r in con.execute("SELECT id, company, title FROM jobs") if radar.file_token(r["id"]) == token), None)
+    try:
+        with db() as con:
+            job = next((r for r in con.execute("SELECT id, company, title FROM jobs") if radar.file_token(r["id"]) == token), None)
+    except sqlite3.Error:  # e.g. the worker holds a write lock: serve the file with the plain name instead of failing
+        job = None
     filename = download_name(job["company"], job["title"], name) if job else f"resume-{name}"
     return FileResponse(path, media_type=media, filename=filename)
 
