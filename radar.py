@@ -451,6 +451,8 @@ def open_db() -> sqlite3.Connection:
                             ("resume_versions", "label", "TEXT"), ("resume_versions", "keep", "INTEGER NOT NULL DEFAULT 0")):
         if col not in {r["name"] for r in db.execute(f"PRAGMA table_info({table})")}:
             db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+    if "also_on" not in cols:
+        db.execute("ALTER TABLE jobs ADD COLUMN also_on TEXT")  # JSON list of other sources the same posting was seen on
     if "distance_km" not in cols:
         db.execute("ALTER TABLE jobs ADD COLUMN distance_km REAL")
         for r in db.execute("SELECT id, description FROM jobs WHERE source = 'BA'").fetchall():
@@ -469,24 +471,49 @@ def dedup_key(company: str, title: str) -> str:
     return f"{norm(company)}|{norm(title)}"
 
 
+def city_key(location: str | None) -> str:
+    """Normalised first part of a location ("Darmstadt, Hessen" -> "darmstadt"); empty when unknown."""
+    first = re.split(r"[,;/|(]", location or "", maxsplit=1)[0]
+    return re.sub(r"\s+", " ", _TITLE_NOISE.sub(" ", first.lower())).strip()
+
+
+def _add_also_on(db: sqlite3.Connection, job_id: str, source: str) -> None:
+    """Remember that the kept posting was also seen on another source (shown as "also on X" in the dashboard)."""
+    row = db.execute("SELECT source, also_on FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    if row is None or not source or source == row["source"]:
+        return
+    try:
+        seen = [str(x) for x in json.loads(row["also_on"] or "[]")]
+    except ValueError:
+        seen = []
+    if source not in seen:
+        db.execute("UPDATE jobs SET also_on = ? WHERE id = ?", (json.dumps(seen + [source], ensure_ascii=False), job_id))
+
+
 def store_new(db: sqlite3.Connection, jobs: list[dict]) -> None:
-    """Insert unseen jobs; the same company+title from another source (or repost) is dropped."""
-    known = {dedup_key(r["company"], r["title"]) for r in db.execute("SELECT company, title FROM jobs")}
+    """Insert unseen jobs. A posting is a duplicate when company and title match AND the city matches (or one of the
+    two has no city, so we cannot tell them apart). The same generic title in two cities is kept as two jobs."""
+    known: dict[str, list[tuple[str, str]]] = {}  # company|title -> [(job id, city)]
+    for r in db.execute("SELECT id, company, title, location FROM jobs"):
+        known.setdefault(dedup_key(r["company"], r["title"]), []).append((r["id"], city_key(r["location"])))
     dropped = 0
     for j in jobs:
-        key = dedup_key(j["company"], j["title"])
+        key, city = dedup_key(j["company"], j["title"]), city_key(j.get("location"))
         if db.execute("SELECT 1 FROM jobs WHERE id = ?", (j["id"],)).fetchone():
             continue
-        if key in known and j["company"]:
+        match = next((m for m in known.get(key, []) if not city or not m[1] or m[1] == city), None) if j["company"] else None
+        if match:
             dropped += 1
+            log(f"duplicate posting dropped: {j['id']} {j['title']!r} @ {j['company']!r} ({city or 'no city'}) matches {match[0]}")
+            _add_also_on(db, match[0], j.get("source", ""))
             continue
-        known.add(key)
+        known.setdefault(key, []).append((j["id"], city))
         db.execute(
             "INSERT OR IGNORE INTO jobs (id, source, title, company, location, distance_km, url, description) "
             "VALUES (:id, :source, :title, :company, :location, :distance_km, :url, :description)", j)
     db.commit()
     if dropped:
-        log(f"dropped {dropped} duplicate postings (same company + title)")
+        log(f"dropped {dropped} duplicate postings (same company + title + city)")
 
 
 # --- ranking via claude -p ---------------------------------------------------

@@ -1,6 +1,7 @@
 import os
 import re
 import unittest
+from unittest import mock
 
 from tests.helpers import Row, fresh_db, insert_job, radar
 
@@ -62,6 +63,65 @@ class DistanceAndDedupTests(unittest.TestCase):
         radar.store_new(db, [{**job, "id": "an:9", "source": "Arbeitnow"}, {**job, "id": "ba:1"}])
         self.assertEqual(db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 1)
         db.close()
+
+
+class DedupeByCityTests(unittest.TestCase):
+    JOB = {"source": "BA", "title": "Werkstudent (m/w/d)", "company": "Beispiel GmbH", "location": "Darmstadt",
+           "distance_km": 1.0, "url": "u", "description": "d"}
+
+    def setUp(self):
+        self._keep = fresh_db()
+        self.db = radar.open_db()
+
+    def tearDown(self):
+        self.db.close()
+
+    def ids(self):
+        return [r[0] for r in self.db.execute("SELECT id FROM jobs ORDER BY id")]
+
+    def test_the_same_generic_title_in_two_cities_is_kept_twice(self):
+        radar.store_new(self.db, [{**self.JOB, "id": "a:1"}, {**self.JOB, "id": "a:2", "location": "Frankfurt am Main"}])
+        self.assertEqual(self.ids(), ["a:1", "a:2"])
+
+    def test_the_same_posting_on_two_sources_is_collapsed_and_remembers_the_other_source(self):
+        radar.store_new(self.db, [{**self.JOB, "id": "ba:1"}])
+        radar.store_new(self.db, [{**self.JOB, "id": "sw:7", "source": "Stellenwerk", "location": "Darmstadt, Hessen"}])
+        self.assertEqual(self.ids(), ["ba:1"])
+        self.assertEqual(self.db.execute("SELECT also_on FROM jobs").fetchone()[0], '["Stellenwerk"]')
+
+    def test_a_repost_from_the_same_source_is_dropped_without_an_also_on_entry(self):
+        radar.store_new(self.db, [{**self.JOB, "id": "ba:1"}, {**self.JOB, "id": "ba:2"}])
+        self.assertEqual(self.ids(), ["ba:1"])
+        self.assertIsNone(self.db.execute("SELECT also_on FROM jobs").fetchone()[0])
+
+    def test_a_missing_city_falls_back_to_company_and_title(self):
+        radar.store_new(self.db, [{**self.JOB, "id": "ba:1"}, {**self.JOB, "id": "an:1", "source": "Arbeitnow", "location": ""}])
+        self.assertEqual(self.ids(), ["ba:1"])
+
+    def test_two_different_cities_in_one_batch_and_a_later_duplicate_of_the_second(self):
+        radar.store_new(self.db, [{**self.JOB, "id": "a:1"}, {**self.JOB, "id": "a:2", "location": "Mainz"}])
+        radar.store_new(self.db, [{**self.JOB, "id": "b:3", "source": "Stellenwerk", "location": "Mainz (Rheinland-Pfalz)"}])
+        self.assertEqual(self.ids(), ["a:1", "a:2"])
+        self.assertEqual(self.db.execute("SELECT also_on FROM jobs WHERE id = 'a:2'").fetchone()[0], '["Stellenwerk"]')
+
+    def test_the_log_line_names_the_dropped_posting_and_the_one_it_matched(self):
+        radar.store_new(self.db, [{**self.JOB, "id": "ba:1"}])
+        with mock.patch.object(radar, "log") as log:
+            radar.store_new(self.db, [{**self.JOB, "id": "an:9", "source": "Arbeitnow"}])
+        lines = " ".join(str(c.args[0]) for c in log.call_args_list)
+        self.assertIn("an:9", lines)
+        self.assertIn("ba:1", lines)
+        self.assertIn("Beispiel GmbH", lines)
+
+    def test_a_job_without_a_company_is_never_deduplicated(self):
+        radar.store_new(self.db, [{**self.JOB, "id": "a:1", "company": ""}, {**self.JOB, "id": "a:2", "company": ""}])
+        self.assertEqual(self.ids(), ["a:1", "a:2"])
+
+    def test_city_key(self):
+        self.assertEqual(radar.city_key("Darmstadt, Hessen"), "darmstadt")
+        self.assertEqual(radar.city_key("Mainz (Rheinland-Pfalz)"), "mainz")
+        self.assertEqual(radar.city_key("  Frankfurt am Main "), "frankfurt am main")
+        self.assertEqual(radar.city_key(None), "")
 
 
 class EmailTests(unittest.TestCase):

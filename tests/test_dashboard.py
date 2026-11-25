@@ -497,6 +497,19 @@ class MigrationTests(unittest.TestCase):
             db.close()
 
 
+class AlsoOnTests(unittest.TestCase):
+    def card(self, also):
+        return d.render_card(Row(id="t:1", title="x", status="new", score=60, first_seen="2026-01-01 00:00:00", source="BA", also_on=also))
+
+    def test_the_card_shows_the_other_sources_escaped(self):
+        h = self.card('["Stellenwerk", "<b>x</b>"]')
+        self.assertIn("also on Stellenwerk, &lt;b&gt;x&lt;/b&gt;", h)
+
+    def test_no_label_without_entries_or_with_broken_json(self):
+        for v in (None, "[]", "not json"):
+            self.assertNotIn("also on", self.card(v))
+
+
 class FitPanelTests(unittest.TestCase):
     MD = """## Verdict
 Good fit.
