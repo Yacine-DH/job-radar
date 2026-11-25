@@ -58,6 +58,14 @@ address, checks `Host`/`Origin`, requires JSON for POSTs, sends a nonce CSP, esc
 files matching `^[0-9a-f]{16}\.(pdf|tex)$`. Another Tailscale account has a device visible on the tailnet:
 consider a password before exposing anything more sensitive.
 
+## Repositories and identity
+- `origin` = the public repo `Yacine-DH/job-radar` (history was scrubbed once: no e-mail, hostnames, tailnet name or user
+  paths). `archive` = the private `Yacine-DH/job-radar-archive` (old history, all old PRs and review threads).
+- The local branch `pre-public-backup` holds the OLD, unscrubbed history. Never push it, never merge from it.
+- Commits in this checkout use the GitHub noreply address (repo-local git config), so they are credited to the owner
+  without exposing a real e-mail. Never add hostnames, addresses or contact data to files, commits or issues.
+- Japanese Ultimate Sensei (`Yacine-DH/japanese-ultimate-sensei`) is public (MIT) since 2026-11-25.
+
 ## Never commit (all git-ignored)
 `.env*`, `jobs.db`, `cv/` (master CV `cv-content.tex`, derived `profile.md`, generated resumes), `profile.md`,
 `.orca/`, `.venv/`. The repo is PUBLIC: never commit the CV, contact data, hostnames or addresses. A stray `.env.`
