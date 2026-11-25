@@ -410,39 +410,53 @@ def set_label(db: sqlite3.Connection, job_id: str, n: int, label: str) -> None:
 def delete_versions(db: sqlite3.Connection, job_id: str, n: int | None = None, all_older: bool = False) -> list[int]:
     """Delete archived versions; `all_older` skips the newest and pinned (labelled) versions. Deleting the newest
     version (the current resume) makes the previous one current again, or, if it was the only one, removes the resume
-    and resets the job's tailor state. Rows go first, then files."""
-    rows = db.execute("SELECT n, keep, pdf, warnings FROM resume_versions WHERE job_id = ? ORDER BY n DESC", (job_id,)).fetchall()
-    if not rows:
-        raise ValueError("this job has no archived versions")
-    newest = rows[0]["n"]
-    if all_older:
-        targets = [r["n"] for r in rows[1:] if not r["keep"]]
-    else:
-        if n not in {r["n"] for r in rows}:
-            raise ValueError(f"version {n} does not exist")
-        targets = [n]
-    token = radar.file_token(job_id)
-    if newest in targets:  # the current resume goes away: promote the previous version (files first, so nothing is lost on error)
-        prev = rows[1] if len(rows) > 1 else None
-        cur_tex, cur_pdf = radar.TAILORED_DIR / f"{token}.tex", radar.TAILORED_DIR / f"{token}.pdf"
-        if prev is not None:
+    and resets the job's tailor state. Refused while a resume is queued or being generated for the job.
+    One write transaction (BEGIN IMMEDIATE) checks and changes the rows, so a worker, the dashboard and the CLI
+    serialize; files follow the commit: the promoted version is copied over the current names (atomic replace) and
+    only then are the deleted archive files removed."""
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        if db.execute("SELECT 1 FROM tailor_jobs WHERE job_id = ? AND state IN ('queued', 'running')", (job_id,)).fetchone():
+            raise ValueError("a resume is being generated for this job: wait until it is done")
+        rows = db.execute("SELECT n, created, keep, pdf, warnings FROM resume_versions WHERE job_id = ? ORDER BY n DESC",
+                          (job_id,)).fetchall()
+        if not rows:
+            raise ValueError("this job has no archived versions")
+        newest = rows[0]["n"]
+        if all_older:
+            targets = [r["n"] for r in rows[1:] if not r["keep"]]
+        else:
+            if n not in {r["n"] for r in rows}:
+                raise ValueError(f"version {n} does not exist")
+            targets = [n]
+        token = radar.file_token(job_id)
+        promote = None  # (previous version row, its files) when the current resume is being deleted
+        if newest in targets and len(rows) > 1:
+            prev = rows[1]
             src_tex, src_pdf = radar.version_path(token, prev["n"], "tex"), radar.version_path(token, prev["n"], "pdf")
             if not src_tex.exists():
                 raise ValueError(f"version {prev['n']} has no files any more, so it cannot become current")
-            _private_copy(src_tex, cur_tex)
-            if src_pdf.exists():
-                _private_copy(src_pdf, cur_pdf)
-            else:
-                cur_pdf.unlink(missing_ok=True)
-            db.execute("UPDATE tailor_jobs SET pdf = ?, warnings = ? WHERE job_id = ?",
-                       (int(src_pdf.exists()), prev["warnings"], job_id))
-        else:
-            cur_tex.unlink(missing_ok=True)
-            cur_pdf.unlink(missing_ok=True)
+            promote = (src_tex, src_pdf if src_pdf.exists() else None)
+            db.execute("UPDATE tailor_jobs SET state = 'done', error = NULL, finished = ?, pdf = ?, warnings = ? WHERE job_id = ?",
+                       (prev["created"], int(promote[1] is not None), prev["warnings"], job_id))
+        elif newest in targets:  # the only version: the resume and the job's tailor state go away
             db.execute("DELETE FROM tailor_jobs WHERE job_id = ?", (job_id,))
-    for t in targets:
-        db.execute("DELETE FROM resume_versions WHERE job_id = ? AND n = ?", (job_id, t))
-    db.commit()
+        for t in targets:
+            db.execute("DELETE FROM resume_versions WHERE job_id = ? AND n = ?", (job_id, t))
+        db.commit()
+    except BaseException:
+        db.rollback()
+        raise
+    cur_tex, cur_pdf = radar.TAILORED_DIR / f"{token}.tex", radar.TAILORED_DIR / f"{token}.pdf"
+    if promote:
+        _private_copy(promote[0], cur_tex)
+        if promote[1]:
+            _private_copy(promote[1], cur_pdf)
+        else:
+            cur_pdf.unlink(missing_ok=True)
+    elif newest in targets:
+        cur_tex.unlink(missing_ok=True)
+        cur_pdf.unlink(missing_ok=True)
     for t in targets:
         for ext in ("tex", "pdf"):
             radar.version_path(token, t, ext).unlink(missing_ok=True)
@@ -509,15 +523,17 @@ def resume_job(db: sqlite3.Connection, job: sqlite3.Row, analysis: str, notes: s
     token = radar.file_token(job["id"])
     tex_path = radar.TAILORED_DIR / f"{token}.tex"
     pdf_path = tex_path.with_suffix(".pdf")
-    ensure_baseline(db, job["id"])  # keep what exists today as a version before it is overwritten
-    pdf_path.unlink(missing_ok=True)
-    warnings: list[str] = []
     base = ""
-    if base_n is not None:  # edit an archived version instead of starting from the master
+    if base_n is not None:  # edit an archived version instead of starting from the master; validate before touching any file
+        if not notes.strip():
+            raise RuntimeError("editing a version needs instructions: say what should change")
         base_tex = radar.version_path(token, base_n, "tex")
         if not base_tex.exists():
             raise RuntimeError(f"version {base_n} is not available any more")
         base = split_master(base_tex.read_text())[1].strip()
+    ensure_baseline(db, job["id"])  # keep what exists today as a version before it is overwritten
+    pdf_path.unlink(missing_ok=True)
+    warnings: list[str] = []
     extra, body, role, lang = "", "", "swe", "en"
     feedback: list[str] = []  # retry notes accumulate, so a later retry never drops an earlier constraint
     claim_retried = False

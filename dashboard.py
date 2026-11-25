@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # run with -I, so add 
 import uvicorn
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import cv
 import radar
@@ -110,7 +110,7 @@ async def set_status(body: StatusUpdate, request: Request):
 class TailorRequest(BaseModel):
     id: str
     notes: str = ""      # what to change (instructions for this one resume)
-    base: int | None = None  # archived version to edit; None = start from the master CV
+    base: int | None = Field(default=None, ge=1, le=2**31 - 1)  # archived version to edit; None = start from the master CV
     label: str = ""      # names and pins the resulting version, e.g. "final"
 
 
@@ -144,6 +144,7 @@ async def request_tailor(body: TailorRequest, request: Request):
     if not radar.CV_TEX.exists():
         return JSONResponse({"error": "cv/cv-content.tex is not on the server"}, status_code=409)
     with db() as con:
+        con.execute("BEGIN IMMEDIATE")  # check and insert as one step, so a concurrent delete or request cannot slip in between
         if con.execute("SELECT 1 FROM jobs WHERE id = ?", (body.id,)).fetchone() is None:
             return JSONResponse({"error": "unknown job"}, status_code=404)
         row = con.execute("SELECT state FROM tailor_jobs WHERE job_id = ?", (body.id,)).fetchone()
@@ -165,7 +166,7 @@ async def request_tailor(body: TailorRequest, request: Request):
 
 class DeleteVersions(BaseModel):
     id: str
-    n: int | None = None
+    n: int | None = Field(default=None, ge=1, le=2**31 - 1)
     all_older: bool = False
 
 
@@ -178,8 +179,6 @@ async def delete_resume_versions(body: DeleteVersions, request: Request):
     if body.n is None and not body.all_older:
         return JSONResponse({"error": "give a version number or all_older"}, status_code=422)
     with db() as con:
-        if con.execute("SELECT 1 FROM tailor_jobs WHERE job_id = ? AND state IN ('queued','running')", (body.id,)).fetchone():
-            return JSONResponse({"error": "a resume is being generated for this job: wait until it is done"}, status_code=409)
         try:
             deleted = cv.delete_versions(con, body.id, body.n, body.all_older)
         except ValueError as exc:
@@ -376,6 +375,21 @@ def md_blocks(lines: list[str]) -> str:
 
 SEVERITY_RE = re.compile(r"\(\s*(critical|important|nice[- ]to[- ]have|minor)\b([^)]*)\)", re.I)
 HOURS_RE = re.compile(r"\bAbout\s+(\d+(?:\s*[\u2013-]\s*\d+)?)\s*h\b\.?", re.I)
+ABBREV = ("e.g", "i.e", "vs", "etc", "z.B", "z. B", "d.h", "ca", "approx", "incl", "bzw", "inkl", "usw")
+
+
+def first_sentence_end(text: str) -> int:
+    """Index of the '. ' that ends the first sentence, ignoring abbreviations, parentheses and **bold**; -1 if none."""
+    depth = 0
+    for i, ch in enumerate(text):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        elif ch == "." and depth == 0 and text[i + 1:i + 2] == " " and text[:i].count("**") % 2 == 0:
+            if not text[:i].lower().endswith(ABBREV) and not re.search(r"(?:^|\s)\w$", text[:i]):
+                return i
+    return -1
 
 
 def split_gap(text: str) -> tuple[str, str, str]:
@@ -386,42 +400,63 @@ def split_gap(text: str) -> tuple[str, str, str]:
         sev = "crit" if m.group(1).lower() in ("critical", "important") else "nice"
         rest = m.group(2).strip(" ;,:")
         text = re.sub(r"\s+([.,;:])", r"\1", text[:m.start()] + (f"({rest})" if rest else "") + text[m.end():]).strip()
-    head, _, detail = text.partition(". ")
+    end = first_sentence_end(text)
+    head, detail = (text, "") if end < 0 else (text[:end], text[end + 1:])
     return sev, head.rstrip(".").strip(), detail.strip()
 
 
-def md_items(lines: list[str]) -> list[str]:
-    return [m.group(1) for ln in lines if (m := re.match(r"^\s*(?:[-*]|\d+[.)])\s+(.*)", ln))]
+def md_items(lines: list[str]) -> tuple[list[str], list[str]]:
+    """(list items, other prose lines). A line right after an item that is not itself an item continues that item
+    (wrapped bullets); prose before the first item, or after a blank line, is returned separately so nothing is lost."""
+    items: list[str] = []
+    prose: list[str] = []
+    after_item = False
+    for ln in lines:
+        m = re.match(r"^\s*(?:[-*]|\d+[.)])\s+(.*)", ln)
+        if m:
+            items.append(m.group(1).strip())
+            after_item = True
+        elif not ln.strip():
+            after_item = False
+        elif after_item:
+            items[-1] += " " + ln.strip()
+        else:
+            prose.append(ln.strip())
+    return items, prose
+
+
+def prose_html(prose: list[str]) -> str:
+    return f'<p class="lead">{inline(e(" ".join(prose)))}</p>' if prose else ""
 
 
 def render_gaps_block(lines: list[str]) -> str:
-    cards = []
-    for raw in md_items(lines):
+    cards, (items, prose) = [], md_items(lines)
+    for raw in items:
         sev, head, detail = split_gap(raw)
         tag = {"crit": '<span class="tag crit">critical</span>', "nice": '<span class="tag nice">nice to have</span>'}.get(sev, "")
         cards.append(f'<li class="gapcard {sev}">{icon("alert", 16)}<div><strong>{inline(e(head))}</strong>{tag}'
                      + (f'<p>{inline(e(detail))}</p>' if detail else "") + "</div></li>")
-    return f'<ul class="gapcards">{"".join(cards)}</ul>' if cards else ""
+    return prose_html(prose) + f'<ul class="gapcards">{"".join(cards)}</ul>' if cards else ""
 
 
 def render_matches_block(lines: list[str]) -> str:
-    rows = []
-    for raw in md_items(lines):
+    rows, (items, prose) = [], md_items(lines)
+    for raw in items:
         req, arrow, ev = raw.partition(" -> ")
         if not arrow:
             rows.append(f'<li class="match">{icon("check", 15, 2.6)}<div>{inline(e(raw))}</div></li>')
             continue
         rows.append(f'<li class="match">{icon("check", 15, 2.6)}<div><strong>{inline(e(req.replace("**", "")))}</strong>'
                     f'<span>{inline(e(ev))}</span></div></li>')
-    return f'<ul class="matches">{"".join(rows)}</ul>' if rows else ""
+    return prose_html(prose) + f'<ul class="matches">{"".join(rows)}</ul>' if rows else ""
 
 
 def render_learn_block(lines: list[str]) -> str:
-    steps = []
-    for i, raw in enumerate(md_items(lines), 1):
+    steps, (items, prose) = [], md_items(lines)
+    for i, raw in enumerate(items, 1):
         hm = HOURS_RE.search(raw)
         hours = f'<span class="hours">{e(hm.group(1).replace(" ", ""))} h</span>' if hm else ""
-        body = HOURS_RE.sub("", raw).strip()
+        body = re.sub(r"\(\s*\)", "", (raw[:hm.start()] + raw[hm.end():]) if hm else raw).strip()  # only the shown estimate leaves the text
         title, sep, detail = body.partition(":")
         if sep and title.startswith("**") and title.endswith("**"):
             title, detail = title.strip("*"), detail.strip()
@@ -429,7 +464,7 @@ def render_learn_block(lines: list[str]) -> str:
             title, detail = "", body
         steps.append(f'<li class="step"><span class="num">{i}</span><div>' + (f"<strong>{e(title)}</strong>" if title else "")
                      + f'<p>{inline(e(detail))}</p></div>{hours}</li>')
-    return f'<ol class="steps">{"".join(steps)}</ol>' if steps else ""
+    return prose_html(prose) + f'<ol class="steps">{"".join(steps)}</ol>' if steps else ""
 
 
 def render_fit(md: str, bnd: str) -> str:
@@ -748,6 +783,7 @@ main{padding:8px 16px 24px;display:flex;flex-direction:column;gap:12px}
 .hist .vl .lnk{padding:0 8px;font-size:13px}.hist .del,.lnk.del{color:var(--danger)}.hist>.lnk.del{margin-top:4px}
 .tag.keep{background:var(--accent-tint);color:var(--accent-fg)}
 .fit summary .gapcount{margin-left:8px;font-size:12px;font-weight:600;border-radius:999px;padding:1px 8px;background:var(--gap-tint);color:var(--gap-fg);border:1px solid var(--gap-line)}
+.md .lead{margin:0 0 6px;font-size:13px;color:var(--muted)}
 .fitsec h4{display:flex;align-items:center;gap:6px}.fitsec.gaps h4{color:var(--gap-fg)}
 .gapcards,.matches,.steps{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}
 .gapcard{display:flex;gap:10px;align-items:flex-start;background:var(--gap-tint);border:1px solid var(--gap-line);border-left:4px solid var(--gap-bar);border-radius:8px;padding:8px 10px}

@@ -241,7 +241,7 @@ class ResumeLoopTests(unittest.TestCase):
         radar.TAILORED_DIR, radar.CV_TEX = self._old
         self._tmp.cleanup()
 
-    def run_job(self, bodies, verifier=None, verify=True, compiles=None):
+    def run_job(self, bodies, verifier=None, verify=True, compiles=None, **kw):
         """compiles=None: no LaTeX engine; otherwise a list of True/False results, one per compile call."""
         self.gen = mock.Mock(side_effect=[(b, "devops", "de") for b in bodies])
         self.ver = mock.Mock(side_effect=verifier or (lambda body, master: []))
@@ -261,7 +261,7 @@ class ResumeLoopTests(unittest.TestCase):
         with contextlib.ExitStack() as stack:
             for patch in patches:
                 stack.enter_context(patch)
-            return cv.resume_job(self.db, self.job, "analysis")
+            return cv.resume_job(self.db, self.job, "analysis", **kw)
 
     def test_a_clean_first_draft_needs_one_generation(self):
         res = self.run_job([self.GOOD])
@@ -351,6 +351,38 @@ class FactFlaggingTests(unittest.TestCase):
             self.assertIn(expected, flagged)
 
 
+class EditModeTests(ResumeLoopTests):
+    """resume_job(base_n=...): edit an archived version; refuse bad requests before touching any file."""
+
+    def archive(self, text="% role=devops lang=de\n" + PADDING):
+        token = radar.file_token("t:1")
+        (radar.TAILORED_DIR / f"{token}.tex").write_text(MASTER.split("\\begin{document}")[0] + "\\begin{document}\n" + text + "\n\\end{document}\n")
+        (radar.TAILORED_DIR / f"{token}.pdf").write_bytes(b"%PDF current")
+        return token, cv.snapshot_version(self.db, "t:1", "devops", "de", [])
+
+    def test_a_missing_base_version_changes_nothing_on_disk(self):
+        token, _ = self.archive()
+        with self.assertRaises(RuntimeError):
+            self.run_job([self.GOOD], base_n=99, notes="swap something")
+        self.assertEqual((radar.TAILORED_DIR / f"{token}.pdf").read_bytes(), b"%PDF current")  # the current PDF survived
+        self.assertEqual(self.gen.call_count, 0)
+
+    def test_editing_a_version_without_instructions_is_refused_before_any_work(self):
+        token, n = self.archive()
+        with self.assertRaises(RuntimeError) as ctx:
+            self.run_job([self.GOOD], base_n=n, notes="  ")
+        self.assertIn("instructions", str(ctx.exception))
+        self.assertTrue((radar.TAILORED_DIR / f"{token}.pdf").exists())
+
+    def test_edit_passes_the_base_body_and_pins_the_labelled_result(self):
+        _, n = self.archive()
+        res = self.run_job([self.GOOD], base_n=n, notes="swap A for B", label="final")
+        self.assertEqual(res["version"], 2)
+        self.assertEqual(self.gen.call_args.args[5].strip()[:20], ("% role=devops lang=de")[:20])  # base= the archived body
+        row = self.db.execute("SELECT label, keep FROM resume_versions WHERE n = 2").fetchone()
+        self.assertEqual((row["label"], row["keep"]), ("final", 1))
+
+
 class PrivateLinkTests(unittest.TestCase):
     MASTER = "\\privlink{AcmeTool} \\plink{https://example.org/a}{Beta}"
 
@@ -417,6 +449,41 @@ class VersionHistoryTests(unittest.TestCase):
         self.assertEqual([r["n"] for r in self.rows()], [2, 3])
         self.assertFalse(self.archived(1, "tex").exists() or self.archived(1, "pdf").exists())
         self.assertTrue(self.archived(2, "tex").exists())
+
+    def test_deletion_is_refused_while_a_resume_is_queued_or_running_and_changes_nothing(self):
+        self.make(2)
+        for state in ("queued", "running"):
+            self.db.execute("INSERT OR REPLACE INTO tailor_jobs (job_id, state) VALUES (?, ?)", (self.job, state))
+            self.db.commit()
+            with self.assertRaises(ValueError) as ctx:
+                cv.delete_versions(self.db, self.job, 1)
+            self.assertIn("being generated", str(ctx.exception))
+        self.assertEqual([r["n"] for r in self.rows()], [1, 2])
+        self.assertTrue(self.archived(1, "tex").exists())
+        self.assertEqual(self.db.execute("SELECT state FROM tailor_jobs").fetchone()[0], "running")  # untouched
+
+    def test_promoting_the_previous_version_resets_a_failed_state_and_the_timestamp(self):
+        self.make(2)
+        self.db.execute("UPDATE resume_versions SET created = '2026-01-02 03:04:05' WHERE n = 1")
+        self.db.execute("INSERT INTO tailor_jobs (job_id, state, error, finished) VALUES (?, 'failed', 'boom', '2026-09-09 09:09:09')", (self.job,))
+        self.db.commit()
+        cv.delete_versions(self.db, self.job, 2)
+        tj = self.db.execute("SELECT state, error, finished FROM tailor_jobs WHERE job_id = ?", (self.job,)).fetchone()
+        self.assertEqual((tj["state"], tj["error"], tj["finished"]), ("done", None, "2026-01-02 03:04:05"))
+
+    def test_a_failure_while_promoting_leaves_the_database_consistent_with_the_rows_deleted_only_after_commit(self):
+        self.make(2)
+        self.archived(1, "tex").unlink()
+        with self.assertRaises(ValueError):
+            cv.delete_versions(self.db, self.job, 2)
+        self.assertEqual([r["n"] for r in self.rows()], [1, 2])  # nothing was deleted; the transaction was rolled back
+        self.assertFalse(self.db.in_transaction)
+
+    def test_a_trailing_newline_is_not_a_valid_label(self):
+        self.make(1)
+        for bad in ("final\n", "\nfinal"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                cv.set_label(self.db, self.job, 1, bad)
 
     def test_unknown_versions_cannot_be_deleted(self):
         self.make(2)

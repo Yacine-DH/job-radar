@@ -1,4 +1,7 @@
+import asyncio
 import json
+import sqlite3
+import tempfile
 import unittest
 from datetime import datetime
 
@@ -184,8 +187,6 @@ class HistoryRenderingTests(unittest.TestCase):
         self.assertIn('aria-label="Download version 1 LaTeX source"', out)
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 
@@ -259,6 +260,125 @@ class DemoTests(unittest.TestCase):
             self.assertNotIn(forbidden, blob)
 
 
+class RouteTests(unittest.TestCase):
+    """The new JSON routes called directly (no HTTP server in the test environment): validation, origin check, persistence."""
+
+    class Req:
+        def __init__(self, origin=None):
+            self.headers = {"origin": origin} if origin else {}
+
+    def setUp(self):
+        from pathlib import Path
+        from unittest import mock
+        self._keep = fresh_db()
+        self._tmp = tempfile.TemporaryDirectory()
+        self._conns = []
+        self._old = (radar.CV_TEX, radar.TAILORED_DIR)
+        radar.CV_TEX = Path(self._tmp.name) / "master.tex"
+        radar.CV_TEX.write_text("x")
+        radar.TAILORED_DIR = Path(self._tmp.name)
+
+        def connect():
+            con = sqlite3.connect(radar.DB_PATH, timeout=10)
+            con.row_factory = sqlite3.Row
+            self._conns.append(con)
+            return con
+
+        self._patch = mock.patch.object(d, "db", connect)
+        self._patch.start()
+        setup = radar.open_db()
+        self.token = radar.file_token("t:1")
+        setup.execute("INSERT INTO jobs (id, title, status) VALUES ('t:1', 'x', 'new')")
+        for n in (1, 2):
+            setup.execute("INSERT INTO resume_versions (job_id, n) VALUES ('t:1', ?)", (n,))
+            for ext in ("tex", "pdf"):
+                radar.version_path(self.token, n, ext).write_bytes(b"v%d" % n)
+        setup.commit()
+        setup.close()
+
+    def tearDown(self):
+        self._patch.stop()
+        for con in self._conns:
+            con.close()
+        radar.CV_TEX, radar.TAILORED_DIR = self._old
+        self._tmp.cleanup()
+
+    def call(self, fn, body, origin=None):
+        res = asyncio.run(fn(body, self.Req(origin)))
+        return getattr(res, "status_code", 200), (json.loads(res.body) if hasattr(res, "body") else res)
+
+    def row(self, sql):
+        con = sqlite3.connect(radar.DB_PATH)
+        try:
+            return con.execute(sql).fetchone()
+        finally:
+            con.close()
+
+    def test_a_valid_edit_request_persists_notes_base_and_label(self):
+        status, body = self.call(d.request_tailor, d.TailorRequest(id="t:1", notes=" swap A for B ", base=1, label="final"))
+        self.assertEqual((status, body), (200, {"state": "queued"}))
+        self.assertEqual(self.row("SELECT notes, base_n, label, state FROM tailor_jobs"), ("swap A for B", 1, "final", "queued"))
+
+    def test_bad_origin_unknown_version_missing_notes_and_bad_label_are_rejected(self):
+        self.assertEqual(self.call(d.request_tailor, d.TailorRequest(id="t:1"), origin="http://evil.example")[0], 403)
+        self.assertEqual(self.call(d.request_tailor, d.TailorRequest(id="t:1", notes="x", base=7))[0], 422)
+        self.assertEqual(self.call(d.request_tailor, d.TailorRequest(id="t:1", base=1))[0], 422)
+        self.assertEqual(self.call(d.request_tailor, d.TailorRequest(id="t:1", label="a;b"))[0], 422)
+        self.assertEqual(self.call(d.request_tailor, d.TailorRequest(id="nope"))[0], 404)
+        self.assertIsNone(self.row("SELECT 1 FROM tailor_jobs"))
+
+    def test_numbers_outside_the_sqlite_range_are_a_validation_error_not_a_crash(self):
+        from pydantic import ValidationError
+        for bad in (2**63, 0, -1):
+            with self.assertRaises(ValidationError, msg=bad):
+                d.TailorRequest(id="t:1", notes="x", base=bad)
+            with self.assertRaises(ValidationError, msg=bad):
+                d.DeleteVersions(id="t:1", n=bad)
+
+    def test_delete_route_checks_origin_and_active_jobs_and_deletes_the_newest_too(self):
+        self.assertEqual(self.call(d.delete_resume_versions, d.DeleteVersions(id="t:1", n=1), origin="http://evil.example")[0], 403)
+        self.assertEqual(self.call(d.delete_resume_versions, d.DeleteVersions(id="t:1"))[0], 422)
+        con = sqlite3.connect(radar.DB_PATH)
+        con.execute("INSERT INTO tailor_jobs (job_id, state) VALUES ('t:1', 'running')")
+        con.commit()
+        con.close()
+        self.assertEqual(self.call(d.delete_resume_versions, d.DeleteVersions(id="t:1", n=1))[0], 409)
+        con = sqlite3.connect(radar.DB_PATH)
+        con.execute("UPDATE tailor_jobs SET state = 'done'")
+        con.commit()
+        con.close()
+        self.assertEqual(self.call(d.delete_resume_versions, d.DeleteVersions(id="t:1", n=2)), (200, {"deleted": [2]}))
+        self.assertEqual((radar.TAILORED_DIR / f"{self.token}.tex").read_bytes(), b"v1")  # v1 is current again
+
+
+class MigrationTests(unittest.TestCase):
+    def test_an_old_database_gains_the_new_columns_and_keeps_its_rows(self):
+        from pathlib import Path
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        old = radar.DB_PATH
+        self.addCleanup(setattr, radar, "DB_PATH", old)
+        radar.DB_PATH = Path(tmp.name) / "old.db"
+        con = sqlite3.connect(radar.DB_PATH)
+        con.execute("CREATE TABLE tailor_jobs (job_id TEXT PRIMARY KEY, state TEXT NOT NULL, requested TEXT, finished TEXT, error TEXT, pdf INTEGER NOT NULL DEFAULT 0, warnings TEXT)")
+        con.execute("CREATE TABLE resume_versions (job_id TEXT NOT NULL, n INTEGER NOT NULL, created TEXT, role TEXT, lang TEXT, pdf INTEGER NOT NULL DEFAULT 0, warnings TEXT, PRIMARY KEY (job_id, n))")
+        con.execute("INSERT INTO tailor_jobs (job_id, state) VALUES ('t:1', 'done')")
+        con.execute("INSERT INTO resume_versions (job_id, n) VALUES ('t:1', 1)")
+        con.commit()
+        con.close()
+        db = radar.open_db()
+        try:
+            tj = {r["name"] for r in db.execute("PRAGMA table_info(tailor_jobs)")}
+            rv = {r["name"] for r in db.execute("PRAGMA table_info(resume_versions)")}
+            self.assertLessEqual({"notes", "base_n", "label"}, tj)
+            self.assertLessEqual({"label", "keep"}, rv)
+            self.assertEqual(db.execute("SELECT keep, label FROM resume_versions").fetchone()[:], (0, None))
+            self.assertEqual(db.execute("SELECT state FROM tailor_jobs").fetchone()[0], "done")
+            radar.open_db().close()  # opening twice must not fail on the existing columns
+        finally:
+            db.close()
+
+
 class FitPanelTests(unittest.TestCase):
     MD = """## Verdict
 Good fit.
@@ -314,6 +434,27 @@ Hello <b>there</b>.
         self.assertNotIn("<b>there</b>", h)
         self.assertIn("&lt;b&gt;there&lt;/b&gt;", h)
         self.assertIn('<details class="sub">', h)
+
+    def test_wrapped_bullets_and_prose_lines_are_kept_not_dropped(self):
+        md = "## Gaps\nSome intro sentence.\n- Kubernetes is missing\n  and this wrapped line has the detail (nice-to-have)\n- Second gap\n"
+        h = d.render_fit(md, "mid")
+        self.assertIn("Some intro sentence.", h)
+        self.assertIn("this wrapped line has the detail", h)
+        self.assertEqual(h.count('<li class="gapcard'), 2)
+        self.assertIn('class="gapcard nice"', h)
+
+    def test_abbreviations_do_not_split_the_headline(self):
+        sev, head, detail = d.split_gap("Missing cloud tools (e.g. AWS, GCP). Required for the role.")
+        self.assertEqual(head, "Missing cloud tools (e.g. AWS, GCP)")
+        self.assertEqual(detail, "Required for the role.")
+        self.assertEqual(d.split_gap("Uses i.e. tools vs. others. Detail here.")[1], "Uses i.e. tools vs. others")
+
+    def test_a_second_hours_estimate_stays_in_the_text(self):
+        h = d.render_learn_block(["1. **K8s**: install k3s (About 2 h) and deploy an app. About 4 h."])
+        self.assertIn('<span class="hours">2 h</span>', h)
+        self.assertIn("About 4 h", h)
+        self.assertNotIn("()", h)
+
 
     def test_unstructured_text_still_renders(self):
         self.assertIn("plain", d.render_fit("plain text only", "mid"))

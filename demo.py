@@ -85,7 +85,7 @@ def seed(radar, db) -> None:
     db.execute("INSERT INTO tailoring (job_id, track, markdown) VALUES ('demo:1', 'devops', ?)", (FIT,))
     token = radar.file_token("demo:1")
     radar.TAILORED_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
-    versions = [(1, "first draft", 0, 0), (2, None, 1, 0), (3, "final", 2, 1)]
+    versions = [(1, "first draft", 0, 1), (2, None, 1, 0), (3, "final", 2, 1)]  # a label always pins
     for n, label, hours_ago, keep in versions:
         db.execute("INSERT INTO resume_versions (job_id, n, created, role, lang, pdf, warnings, label, keep) "
                    "VALUES ('demo:1', ?, ?, 'devops', 'en', 1, '[]', ?, ?)", (n, ts(hours=3 - hours_ago), label, keep))
