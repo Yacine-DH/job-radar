@@ -522,6 +522,86 @@ class VersionHistoryTests(unittest.TestCase):
             with self.assertRaises(ValueError, msg=repr(bad)):
                 cv.set_label(self.db, self.job, 1, bad)
 
+    def test_several_versions_can_be_deleted_at_once_and_duplicates_are_harmless(self):
+        self.make(4)
+        self.assertEqual(sorted(cv.delete_versions(self.db, self.job, [1, 3, 3])), [1, 3])
+        self.assertEqual([r["n"] for r in self.rows()], [2, 4])
+        self.assertTrue(self.archived(4, "tex").exists() and not self.archived(1, "tex").exists() and not self.archived(3, "tex").exists())
+        self.assertEqual((radar.TAILORED_DIR / f"{self.token}.tex").read_text(), "text 4")  # the current resume was not touched
+
+    def test_deleting_the_current_version_among_several_promotes_the_newest_remaining_one(self):
+        self.make(4)
+        cv.delete_versions(self.db, self.job, [4, 3])
+        self.assertEqual([r["n"] for r in self.rows()], [1, 2])
+        self.assertEqual((radar.TAILORED_DIR / f"{self.token}.tex").read_text(), "text 2")
+
+    def test_selecting_everything_removes_the_resume_and_resets_the_job(self):
+        self.make(2)
+        self.db.execute("INSERT INTO tailor_jobs (job_id, state) VALUES (?, 'done')", (self.job,))
+        self.db.commit()
+        cv.delete_versions(self.db, self.job, [1, 2])
+        self.assertEqual(self.rows(), [])
+        self.assertFalse((radar.TAILORED_DIR / f"{self.token}.tex").exists())
+        self.assertIsNone(self.db.execute("SELECT 1 FROM tailor_jobs WHERE job_id = ?", (self.job,)).fetchone())
+
+    def test_an_empty_or_partly_unknown_selection_deletes_nothing(self):
+        self.make(2)
+        for bad in ([], [1, 9]):
+            with self.assertRaises(ValueError, msg=bad):
+                cv.delete_versions(self.db, self.job, bad)
+        self.assertEqual([r["n"] for r in self.rows()], [1, 2])
+        self.assertTrue(self.archived(1, "tex").exists())
+
+    def test_pin_and_unpin(self):
+        self.make(2)
+        cv.set_pin(self.db, self.job, 1, True)
+        self.assertEqual([(r["n"], r["keep"], r["label"]) for r in self.rows()], [(1, 1, None), (2, 0, None)])
+        cv.set_label(self.db, self.job, 2, "final")
+        cv.set_pin(self.db, self.job, 2, False)                      # unpinning also drops the label: a label always pins
+        self.assertEqual([(r["n"], r["keep"], r["label"]) for r in self.rows()], [(1, 1, None), (2, 0, None)])
+        with self.assertRaises(ValueError):
+            cv.set_pin(self.db, self.job, 9, True)
+        self.assertFalse(self.db.in_transaction)
+
+    def test_pinning_a_labelled_version_keeps_its_label_and_unpinning_removes_it(self):
+        self.make(2)
+        cv.set_label(self.db, self.job, 2, "final")
+        cv.set_pin(self.db, self.job, 2, True)                       # pin again: the label must survive
+        self.assertEqual([(r["n"], r["keep"], r["label"]) for r in self.rows()][1], (2, 1, "final"))
+        cv.set_pin(self.db, self.job, 2, False)
+        self.assertEqual([(r["n"], r["keep"], r["label"]) for r in self.rows()][1], (2, 0, None))
+
+    def test_a_boolean_is_not_a_version_number(self):
+        self.make(2)
+        for bad in (True, [True], [1, False]):
+            with self.assertRaises(ValueError, msg=bad):
+                cv.delete_versions(self.db, self.job, bad)
+        self.assertEqual([r["n"] for r in self.rows()], [1, 2])
+
+    def test_bulk_delete_promoting_a_version_with_missing_files_rolls_everything_back(self):
+        self.make(4)
+        self.archived(2, "tex").unlink()                             # the version that would become current has no files
+        with self.assertRaises(ValueError):
+            cv.delete_versions(self.db, self.job, [4, 3])
+        self.assertEqual([r["n"] for r in self.rows()], [1, 2, 3, 4])
+        self.assertTrue(self.archived(3, "tex").exists() and self.archived(4, "tex").exists())
+        self.assertEqual((radar.TAILORED_DIR / f"{self.token}.tex").read_text(), "text 4")
+        self.assertFalse(self.db.in_transaction)
+
+    def test_a_pinned_version_survives_retention_and_an_unpinned_one_does_not(self):
+        old = radar.KEEP_VERSIONS
+        radar.KEEP_VERSIONS = 1
+        try:
+            self.make(1)
+            cv.set_pin(self.db, self.job, 1, True)
+            self.make(3)                                              # snapshots 2, 3, 4
+            self.assertEqual([r["n"] for r in self.rows()], [1, 4])
+            cv.set_pin(self.db, self.job, 1, False)
+            self.make(1)                                              # snapshot 5 prunes the unpinned v1 and v4
+        finally:
+            radar.KEEP_VERSIONS = old
+        self.assertEqual([r["n"] for r in self.rows()], [5])
+
     def test_unknown_versions_cannot_be_deleted(self):
         self.make(2)
         with self.assertRaises(ValueError):

@@ -248,8 +248,11 @@ class DemoTests(unittest.TestCase):
 
     def test_the_card_of_the_demo_job_renders_gaps_history_and_the_pinned_label(self):
         row = self.db.execute(d.ROW_SQL + " WHERE jobs.id = 'demo:1'").fetchone()
-        with d.db() as con:
+        con = d.db()
+        try:  # a `with` on a sqlite connection commits but does not close it
             versions = d.versions_for(con, ["demo:1"])["demo:1"]
+        finally:
+            con.close()
         html = d.render_tailor(row, versions) + d.fit_details(row)
         for needle in ("gapcard crit", "2 gaps", "History (3)", 'class="tag keep">final', 'data-act="resume-delete" data-n="1"'):
             self.assertIn(needle, html)
@@ -366,6 +369,44 @@ class FrontPageTests(unittest.TestCase):
             self.assertIn(needle, h)
 
 
+class HistorySelectionTests(unittest.TestCase):
+    def v(self, n, label=None, keep=0):
+        return Row(job_id="t:1", n=n, created="2026-11-16 09:03:00", role="devops", lang="de", pdf=1, label=label, keep=keep)
+
+    def html(self, versions):
+        return d.render_tailor(Row(id="t:1", score=78, tj_state="done", tj_pdf=1, tj_warnings="[]",
+                                   tj_finished="2026-11-24 16:14:00"), versions)
+
+    def test_every_version_has_a_checkbox_and_the_bulk_controls_start_disabled(self):
+        h = self.html([self.v(3), self.v(2), self.v(1)])
+        for n in (1, 2, 3):
+            self.assertIn(f'<input type="checkbox" class="vsel" data-n="{n}"', h)
+        self.assertIn('data-act="select-all"', h)
+        self.assertRegex(h, r'data-act="resume-delete-selected" disabled>Delete selected \(0\)')
+
+    def test_pin_and_unpin_buttons_reflect_the_state_and_a_pin_without_a_label_shows_pinned(self):
+        h = self.html([self.v(2), self.v(1, None, 1)])
+        self.assertIn('data-act="resume-pin" data-n="1" data-pinned="1"', h)
+        self.assertIn('aria-label="Unpin version 1"', h)
+        self.assertIn('class="tag keep">pinned', h)
+        h2 = self.html([self.v(2), self.v(1)])
+        self.assertIn('data-act="resume-pin" data-n="2" data-pinned="0"', h2)
+        self.assertIn('aria-label="Pin version 2"', h2)
+        self.assertNotIn("tag keep", h2)
+
+    def test_the_pin_button_carries_the_escaped_label_for_the_unpin_warning(self):
+        h = self.html([self.v(2), self.v(1, 'fin"al <b>', 1)])
+        self.assertIn('data-act="resume-pin" data-n="1" data-pinned="1" data-label="fin&quot;al &lt;b&gt;"', h)
+        self.assertIn('data-act="resume-pin" data-n="2" data-pinned="0" data-label=""', h)
+
+    def test_the_script_keeps_open_panels_selection_and_form_text_across_refreshes(self):
+        import inspect
+        src = inspect.getsource(d)
+        for needle in ("$$('details[open]',old)", "$$('input.vsel:checked',old)", "$$('.regenform [data-f]',old)", "syncSel(n)",
+                       "pinVersion(c,", "resume-delete-selected"):
+            self.assertIn(needle, src)
+
+
 class RouteTests(unittest.TestCase):
     """The new JSON routes called directly (no HTTP server in the test environment): validation, origin check, persistence."""
 
@@ -456,6 +497,57 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(self.call(d.delete_resume_versions, d.DeleteVersions(id="t:1", n=2)), (200, {"deleted": [2]}))
         self.assertEqual((radar.TAILORED_DIR / f"{self.token}.tex").read_bytes(), b"v1")  # v1 is current again
 
+
+    def test_delete_route_takes_a_list_and_rejects_nothing_selected_and_bad_numbers(self):
+        status, body = self.call(d.delete_resume_versions, d.DeleteVersions(id="t:1", ns=[1, 2]))
+        self.assertEqual((status, sorted(body["deleted"])), (200, [1, 2]))
+        self.assertEqual(self.call(d.delete_resume_versions, d.DeleteVersions(id="t:1", ns=[]))[0], 422)
+        from pydantic import ValidationError
+        for bad in ([0], [2**40], list(range(1, 52))):
+            with self.assertRaises(ValidationError, msg=bad[:2]):
+                d.DeleteVersions(id="t:1", ns=bad)
+
+    def test_exactly_one_deletion_mode_per_request(self):
+        for body in (d.DeleteVersions(id="t:1", ns=[2], all_older=True), d.DeleteVersions(id="t:1", n=1, ns=[2]),
+                     d.DeleteVersions(id="t:1", n=1, all_older=True), d.DeleteVersions(id="t:1")):
+            self.assertEqual(self.call(d.delete_resume_versions, body)[0], 422, body)
+        con = sqlite3.connect(radar.DB_PATH)
+        try:
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM resume_versions").fetchone()[0], 2)
+        finally:
+            con.close()
+
+    def test_unpin_through_the_route_clears_keep_and_label_and_a_locked_database_is_a_503(self):
+        from unittest import mock
+        con = sqlite3.connect(radar.DB_PATH)
+        con.execute("UPDATE resume_versions SET keep = 1, label = 'final' WHERE n = 1")
+        con.commit()
+        con.close()
+        self.assertEqual(self.call(d.pin_resume_version, d.PinVersion(id="t:1", n=1, pinned=False)), (200, {"pinned": False}))
+        con = sqlite3.connect(radar.DB_PATH)
+        try:
+            self.assertEqual(tuple(con.execute("SELECT keep, label FROM resume_versions WHERE n = 1").fetchone()), (0, None))
+        finally:
+            con.close()
+        with mock.patch.object(d.cv, "set_pin", side_effect=sqlite3.OperationalError("database is locked")):
+            self.assertEqual(self.call(d.pin_resume_version, d.PinVersion(id="t:1", n=1, pinned=True))[0], 503)
+
+    def test_the_script_warns_before_an_unpin_removes_a_label_and_before_deleting_everything(self):
+        import inspect
+        src = inspect.getsource(d)
+        self.assertIn("will be removed too", src)
+        self.assertIn("No version will remain", src)
+        self.assertIn("ns.length===$$('input.vsel',c).length", src)
+
+    def test_pin_route(self):
+        self.assertEqual(self.call(d.pin_resume_version, d.PinVersion(id="t:1", n=1, pinned=True)), (200, {"pinned": True}))
+        con = sqlite3.connect(radar.DB_PATH)
+        try:
+            self.assertEqual(con.execute("SELECT keep FROM resume_versions WHERE n = 1").fetchone()[0], 1)
+        finally:
+            con.close()
+        self.assertEqual(self.call(d.pin_resume_version, d.PinVersion(id="t:1", n=9, pinned=True))[0], 404)
+        self.assertEqual(self.call(d.pin_resume_version, d.PinVersion(id="t:1", n=1, pinned=False), origin="http://evil.example")[0], 403)
 
     def test_a_locked_database_is_a_503_not_a_crash(self):
         from unittest import mock
