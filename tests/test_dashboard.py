@@ -497,6 +497,94 @@ class MigrationTests(unittest.TestCase):
             db.close()
 
 
+class DownloadNameTests(unittest.TestCase):
+    TOKEN = "0123456789abcdef"
+
+    def test_slug_handles_umlauts_ampersands_and_punctuation(self):
+        self.assertEqual(d.slug("Müller & Söhne GmbH", 40), "Mueller-Soehne-GmbH")
+        self.assertEqual(d.slug("Straße (m/w/d) – IT", 40), "Strasse-m-w-d-IT")
+        self.assertEqual(d.slug("Café Ünal", 40), "Cafe-Uenal")
+
+    def test_slug_is_limited_at_a_word_boundary_and_never_empty_handed(self):
+        words = "Werkstudent Softwareentwicklung Python Backend"
+        self.assertEqual(d.slug(words, 31), "Werkstudent-Softwareentwicklung")   # exactly 31 characters fits
+        self.assertEqual(d.slug(words, 30), "Werkstudent")                      # one more word would not: cut at the boundary
+        self.assertLessEqual(len(d.slug("x" * 200, 24)), 24)
+        self.assertEqual(d.slug("x" * 200, 24), "x" * 24)
+        self.assertEqual((d.slug(None, 10), d.slug("", 10), d.slug("&&& ---", 10)), ("", "", ""))
+
+    def test_download_name_for_pdf_tex_and_versions(self):
+        self.assertEqual(d.download_name("Beispiel GmbH", "Werkstudent DevOps (w/m/d)", f"{self.TOKEN}.pdf"),
+                         "Resume_Beispiel-GmbH_Werkstudent-DevOps-w-m-d.pdf")
+        self.assertEqual(d.download_name("Beispiel GmbH", "Werkstudent", f"{self.TOKEN}.tex"), "Resume_Beispiel-GmbH_Werkstudent.tex")
+        self.assertEqual(d.download_name("Beispiel GmbH", "Werkstudent", f"{self.TOKEN}.v12.pdf"), "Resume_Beispiel-GmbH_Werkstudent_v12.pdf")
+
+    def test_empty_company_or_title_and_unknown_shapes(self):
+        self.assertEqual(d.download_name("", "Werkstudent", f"{self.TOKEN}.pdf"), "Resume_Werkstudent.pdf")
+        self.assertEqual(d.download_name(None, None, f"{self.TOKEN}.pdf"), "Resume.pdf")
+        self.assertEqual(d.download_name("A", "B", "../evil.pdf"), "resume-../evil.pdf")  # never reached: the route 404s first
+
+    def test_the_result_is_always_a_safe_ascii_filename(self):
+        for company, title in (('Evil"; filename="x', "a\r\nSet-Cookie: x=1"), ("../../etc", "passwd\x00"), ("日本語", "テスト")):
+            name = d.download_name(company, title, f"{self.TOKEN}.pdf")
+            self.assertRegex(name, r"\AResume(_[A-Za-z0-9-]+)*\.pdf\Z", name)
+            self.assertLessEqual(len(name), 80)
+
+
+class DownloadRouteTests(unittest.TestCase):
+    def setUp(self):
+        from pathlib import Path
+        self._keep = fresh_db()
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old = radar.TAILORED_DIR
+        radar.TAILORED_DIR = Path(self._tmp.name)
+        db = radar.open_db()
+        db.execute("INSERT INTO jobs (id, title, company, status) VALUES ('t:1', 'Werkstudent Python', 'Müller AG', 'new')")
+        db.commit()
+        db.close()
+        self.token = radar.file_token("t:1")
+        for suffix in (".pdf", ".tex", ".v2.pdf"):
+            (radar.TAILORED_DIR / f"{self.token}{suffix}").write_bytes(b"x")
+        (radar.TAILORED_DIR / ("a" * 16 + ".pdf")).write_bytes(b"x")  # a file whose job is unknown
+
+    def tearDown(self):
+        radar.TAILORED_DIR = self._old
+        self._tmp.cleanup()
+
+    def get(self, name):
+        from unittest import mock
+        conns = []
+
+        def connect():
+            con = sqlite3.connect(radar.DB_PATH, timeout=10)
+            con.row_factory = sqlite3.Row
+            conns.append(con)
+            return con
+
+        try:
+            with mock.patch.object(d, "db", connect):
+                return d.download(name)
+        finally:
+            for con in conns:
+                con.close()
+
+    def test_pdf_tex_and_version_downloads_get_friendly_names(self):
+        for suffix, expected in ((".pdf", "Resume_Mueller-AG_Werkstudent-Python.pdf"), (".tex", "Resume_Mueller-AG_Werkstudent-Python.tex"),
+                                 (".v2.pdf", "Resume_Mueller-AG_Werkstudent-Python_v2.pdf")):
+            res = self.get(self.token + suffix)
+            self.assertEqual(res.status_code, 200)
+            self.assertIn(f'filename="{expected}"', res.headers["content-disposition"], suffix)
+
+    def test_an_unknown_job_keeps_the_old_name(self):
+        res = self.get("a" * 16 + ".pdf")
+        self.assertIn('filename="resume-' + "a" * 16 + '.pdf"', res.headers["content-disposition"])
+
+    def test_path_traversal_and_odd_names_still_404(self):
+        for bad in ("../" + self.token + ".pdf", self.token + ".pdf/../x", "%2e%2e%2f" + self.token + ".pdf", self.token + ".exe",
+                    "A" * 16 + ".pdf", self.token + ".v0.pdf", self.token + ".v1234567.pdf", "..", ""):
+            self.assertEqual(self.get(bad).status_code, 404, bad)
+
+
 class FitPanelTests(unittest.TestCase):
     MD = """## Verdict
 Good fit.

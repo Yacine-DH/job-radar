@@ -12,6 +12,7 @@ import re
 import secrets
 import sqlite3
 import sys
+import unicodedata
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -230,6 +231,38 @@ def tailor_fragment(id: str):
 FILE_NAME_RE = re.compile(r"\A[0-9a-f]{16}(\.v[1-9]\d{0,5})?\.(pdf|tex)\Z")  # current files and archived versions
 
 
+_UMLAUTS = str.maketrans({"ä": "ae", "ö": "oe", "ü": "ue", "Ä": "Ae", "Ö": "Oe", "Ü": "Ue", "ß": "ss"})
+_FILE_PARTS_RE = re.compile(r"\A([0-9a-f]{16})(?:\.v([1-9]\d{0,5}))?\.(pdf|tex)\Z")
+
+
+def slug(text: str | None, limit: int) -> str:
+    """ASCII words joined by '-', at most `limit` characters: German umlauts become ae/oe/ue/ss, '&' and other
+    punctuation are dropped, long text is cut at a word boundary."""
+    t = unicodedata.normalize("NFKD", (text or "").translate(_UMLAUTS)).encode("ascii", "ignore").decode()
+    out: list[str] = []
+    used = 0
+    for w in re.findall(r"[A-Za-z0-9]+", t):
+        add = len(w) + (1 if out else 0)
+        if used + add > limit:
+            if not out:
+                out.append(w[:limit])
+            break
+        out.append(w)
+        used += add
+    return "-".join(out)
+
+
+def download_name(company: str | None, title: str | None, name: str) -> str:
+    """Friendly download name 'Resume_<Company>_<Title>[_vN].<ext>' for a file whose on-disk name matched the whitelist.
+    Only this header changes; the files on disk and the whitelist are untouched."""
+    m = _FILE_PARTS_RE.match(name)
+    if not m:
+        return f"resume-{name}"
+    parts = [p for p in (slug(company, 24), slug(title, 36)) if p]
+    base = "Resume" + "".join("_" + p for p in parts) + (f"_v{m.group(2)}" if m.group(2) else "")
+    return f"{base}.{m.group(3)}"
+
+
 @app.get("/files/{name}")
 def download(name: str):
     # Strict whitelist: nothing user-controlled reaches the filesystem path.
@@ -239,7 +272,11 @@ def download(name: str):
     if not path.is_file():
         return JSONResponse({"error": "not found"}, status_code=404)
     media = "application/pdf" if name.endswith(".pdf") else "text/plain; charset=utf-8"
-    return FileResponse(path, media_type=media, filename=f"resume-{name}")
+    token = name[:16]
+    with db() as con:
+        job = next((r for r in con.execute("SELECT id, company, title FROM jobs") if radar.file_token(r["id"]) == token), None)
+    filename = download_name(job["company"], job["title"], name) if job else f"resume-{name}"
+    return FileResponse(path, media_type=media, filename=filename)
 
 
 # --- helpers ---------------------------------------------------------------------------------------
