@@ -824,7 +824,7 @@ main{padding:8px 16px 24px;display:flex;flex-direction:column;gap:12px}
 .hist .vl a{display:inline-flex;align-items:center;min-height:40px;padding:0 8px}
 .hist .vl .lnk{padding:0 8px;font-size:13px}.hist .del,.lnk.del{color:var(--danger)}.hist>.lnk.del{margin-top:4px}
 .tag.keep{background:var(--accent-tint);color:var(--accent-fg)}
-.fit summary .gapcount{margin-left:8px;font-size:12px;font-weight:600;border-radius:999px;padding:1px 8px;background:var(--gap-tint);color:var(--gap-fg);border:1px solid var(--gap-line)}
+.fit summary .gapcount{margin-left:8px;white-space:nowrap;flex-shrink:0;font-size:12px;font-weight:600;border-radius:999px;padding:1px 8px;background:var(--gap-tint);color:var(--gap-fg);border:1px solid var(--gap-line)}
 .md .lead{margin:0 0 6px;font-size:13px;color:var(--muted)}
 .fitsec h4{display:flex;align-items:center;gap:6px}.fitsec.gaps h4{color:var(--gap-fg)}
 .gapcards,.matches,.steps{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}

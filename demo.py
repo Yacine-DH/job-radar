@@ -21,7 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 FIT = """## Verdict
-Strong fit, so apply. Your Python and Docker experience matches the core of this posting and the office is 12 km from Darmstadt.
+Strong fit, so apply. Your Python and Docker experience matches the core of this posting and the office is close to Darmstadt.
 
 ## What matches
 - **Python and SQL** -> two course projects and the Job Radar pipeline (SQLite, FastAPI).

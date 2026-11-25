@@ -5,6 +5,25 @@ postings near Darmstadt, scores each one against your CV with `claude -p`, email
 dashboard where you triage jobs, see which skills you are missing, and generate a tailored one-page resume
 (LaTeX and PDF) for a posting.
 
+<p align="center">
+  <img src="docs/screenshots/dashboard-desktop.png" alt="The Job Radar dashboard on a desktop: filter chips for To triage, Applied, Skipped and Archived, a job card with score 86 and its tailored resume, and a sidebar with the skill gaps of the week" width="900">
+</p>
+
+<table>
+  <tr>
+    <td width="34%"><img src="docs/screenshots/fit-analysis.png" alt="The fit analysis of one job: verdict, skill gaps as amber cards, what matches, numbered learning steps with hours"></td>
+    <td width="34%"><img src="docs/screenshots/resume-history.png" alt="Resume tools: the Regenerate panel (what to change, which version to edit, a label) and the version history with Edit and Delete"></td>
+    <td width="32%"><img src="docs/screenshots/dashboard-phone-dark.png" alt="The dashboard on a phone in dark mode"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>Fit analysis: gaps first, then matches and what to learn</sub></td>
+    <td align="center"><sub>Edit any resume version, pin it, delete the rest</sub></td>
+    <td align="center"><sub>Phone, dark mode</sub></td>
+  </tr>
+</table>
+
+<sub>Screenshots show the demo with made-up jobs (`demo.py`); regenerate them with `docs/make_screenshots.py`.</sub>
+
 ```
 sources ──> filter + dedupe ──> SQLite ──> rank with claude -p ──> email digest
                                    │
