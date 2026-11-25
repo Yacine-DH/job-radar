@@ -249,8 +249,11 @@ class DemoTests(unittest.TestCase):
 
     def test_the_card_of_the_demo_job_renders_gaps_history_and_the_pinned_label(self):
         row = self.db.execute(d.ROW_SQL + " WHERE jobs.id = 'demo:1'").fetchone()
-        with d.db() as con:
+        con = d.db()
+        try:  # a `with` on a sqlite connection commits but does not close it
             versions = d.versions_for(con, ["demo:1"])["demo:1"]
+        finally:
+            con.close()
         html = d.render_tailor(row, versions) + d.fit_details(row)
         for needle in ("gapcard crit", "2 gaps", "History (3)", 'class="tag keep">final', 'data-act="resume-delete" data-n="1"'):
             self.assertIn(needle, html)
