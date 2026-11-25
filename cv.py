@@ -408,21 +408,38 @@ def set_label(db: sqlite3.Connection, job_id: str, n: int, label: str) -> None:
 
 
 def delete_versions(db: sqlite3.Connection, job_id: str, n: int | None = None, all_older: bool = False) -> list[int]:
-    """Delete archived versions. The newest version is the current resume and is never deleted; `all_older` skips
-    pinned (labelled) versions, which must be deleted one by one. Rows go first, then files."""
-    rows = db.execute("SELECT n, keep FROM resume_versions WHERE job_id = ? ORDER BY n DESC", (job_id,)).fetchall()
+    """Delete archived versions; `all_older` skips the newest and pinned (labelled) versions. Deleting the newest
+    version (the current resume) makes the previous one current again, or, if it was the only one, removes the resume
+    and resets the job's tailor state. Rows go first, then files."""
+    rows = db.execute("SELECT n, keep, pdf, warnings FROM resume_versions WHERE job_id = ? ORDER BY n DESC", (job_id,)).fetchall()
     if not rows:
         raise ValueError("this job has no archived versions")
     newest = rows[0]["n"]
     if all_older:
         targets = [r["n"] for r in rows[1:] if not r["keep"]]
     else:
-        if n == newest:
-            raise ValueError("the newest version is your current resume: regenerate first, then delete this one")
         if n not in {r["n"] for r in rows}:
             raise ValueError(f"version {n} does not exist")
         targets = [n]
     token = radar.file_token(job_id)
+    if newest in targets:  # the current resume goes away: promote the previous version (files first, so nothing is lost on error)
+        prev = rows[1] if len(rows) > 1 else None
+        cur_tex, cur_pdf = radar.TAILORED_DIR / f"{token}.tex", radar.TAILORED_DIR / f"{token}.pdf"
+        if prev is not None:
+            src_tex, src_pdf = radar.version_path(token, prev["n"], "tex"), radar.version_path(token, prev["n"], "pdf")
+            if not src_tex.exists():
+                raise ValueError(f"version {prev['n']} has no files any more, so it cannot become current")
+            _private_copy(src_tex, cur_tex)
+            if src_pdf.exists():
+                _private_copy(src_pdf, cur_pdf)
+            else:
+                cur_pdf.unlink(missing_ok=True)
+            db.execute("UPDATE tailor_jobs SET pdf = ?, warnings = ? WHERE job_id = ?",
+                       (int(src_pdf.exists()), prev["warnings"], job_id))
+        else:
+            cur_tex.unlink(missing_ok=True)
+            cur_pdf.unlink(missing_ok=True)
+            db.execute("DELETE FROM tailor_jobs WHERE job_id = ?", (job_id,))
     for t in targets:
         db.execute("DELETE FROM resume_versions WHERE job_id = ? AND n = ?", (job_id, t))
     db.commit()
@@ -445,9 +462,11 @@ def _gen_body(job: sqlite3.Row, analysis: str, master: str, extra: str = "", not
         "- Write that one language directly and flatten the role switches: do NOT use \\T{..}{..}, \\ifde, "
         "\\ifswe, \\ifdevops or \\ifml. Do not define macros or load packages.\n"
         "- Reuse the master's macros and structure: \\entry{title}{org}{date}, \\sub{..}, \\gap, \\gh{owner/repo}, "
-        "\\plink{url}{text}, itemize lists, \\section{..}. Keep the header block (name, contact line) as in the master.\n"
+        "\\plink{url}{text}, \\privlink{text}, itemize lists, \\section{..}. Keep the header block (name, contact line) as in the master.\n"
         "- Clickable names: when you include a project, event or website that has a \\plink in the master, keep that "
         "\\plink with exactly the same URL. Never add, change or invent a link; projects without a \\plink stay plain text.\n"
+        "- Private repos: a project written as \\privlink{Name} in the master (name plus a small padlock instead of the arrow) "
+        "keeps exactly that form. Never turn it into a link and never add a padlock to anything else.\n"
         "- Choose and order the projects, hackathons and skills most relevant to this job; cut the rest. Reword "
         "bullets with the posting's vocabulary only where the CV supports it.\n"
         "- Facts, numbers, tools and links must come from the master. Never mention anything the CV lacks, even if "
@@ -462,7 +481,8 @@ def _gen_body(job: sqlite3.Row, analysis: str, master: str, extra: str = "", not
         "- Apply the OWNER INSTRUCTIONS with the smallest possible change. Keep everything else in BASE exactly as it is: "
         "wording, order, macros, links and the first line `% role=.. lang=..`.\n"
         "- The MASTER CV is the only source of facts, numbers and links. Never add or invent a fact, skill, number or link. "
-        "Keep every \\plink URL exactly as in the master; a project without a \\plink stays plain text.\n"
+        "Keep every \\plink URL exactly as in the master; a project without a \\plink stays plain text, and a "
+        "\\privlink{Name} (private repo, padlock) stays a \\privlink.\n"
         "- When you replace or add an entry, write it in the language of BASE with the same macros (\\entry{..}{..}{..}, "
         "itemize) and take its facts from the master only.\n"
         "- It must still fit ONE A4 page: if a change does not fit, shorten the entry you were asked to change before "

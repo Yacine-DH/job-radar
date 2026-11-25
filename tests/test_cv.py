@@ -351,6 +351,33 @@ class FactFlaggingTests(unittest.TestCase):
             self.assertIn(expected, flagged)
 
 
+class PrivateLinkTests(unittest.TestCase):
+    MASTER = "\\privlink{AcmeTool} \\plink{https://example.org/a}{Beta}"
+
+    def body(self, extra=""):
+        return "x" * 600 + extra
+
+    def test_a_padlock_entry_needs_no_link_and_is_accepted(self):
+        self.assertIsNone(cv.validate_body(self.body("\\privlink{AcmeTool}"), self.MASTER))
+
+    def test_links_inside_other_commands_are_still_checked(self):
+        self.assertIn("link not in the master", cv.validate_body(self.body("\\plink{https://evil.example/x}{Beta}"), self.MASTER))
+
+    def test_both_generator_prompts_tell_the_model_to_keep_the_padlock(self):
+        from tests.helpers import Row
+        sent, old = [], radar.ask_claude
+        radar.ask_claude = lambda prompt, system, **kw: sent.append(prompt) or "% role=devops lang=de\n" + "x" * 600
+        try:
+            master = "\\begin{document}\n\\privlink{AcmeTool}\n\\end{document}"
+            job = Row(id="t:1", title="T", company="C", description="D", cv_track="devops")
+            cv._gen_body(job, "analysis", master)                       # fresh generation
+            cv._gen_body(job, "analysis", master, notes="n", base="old body")  # edit mode
+        finally:
+            radar.ask_claude = old
+        self.assertEqual(len(sent), 2)
+        for prompt in sent:
+            self.assertIn("privlink{Name}", prompt)
+
 class VersionHistoryTests(unittest.TestCase):
     """Every regenerated resume is archived as a numbered version; nothing is lost on Regenerate."""
 
@@ -391,12 +418,48 @@ class VersionHistoryTests(unittest.TestCase):
         self.assertFalse(self.archived(1, "tex").exists() or self.archived(1, "pdf").exists())
         self.assertTrue(self.archived(2, "tex").exists())
 
-    def test_the_newest_version_and_unknown_versions_cannot_be_deleted(self):
+    def test_unknown_versions_cannot_be_deleted(self):
         self.make(2)
-        for n in (2, 9):
-            with self.assertRaises(ValueError, msg=n):
-                cv.delete_versions(self.db, self.job, n)
+        with self.assertRaises(ValueError):
+            cv.delete_versions(self.db, self.job, 9)
         self.assertEqual([r["n"] for r in self.rows()], [1, 2])
+
+    def test_deleting_the_newest_makes_the_previous_version_current(self):
+        self.make(2)
+        self.db.execute("INSERT INTO tailor_jobs (job_id, state, pdf, warnings) VALUES (?, 'done', 1, '[\"new\"]')", (self.job,))
+        self.db.execute("UPDATE resume_versions SET warnings = '[\"old\"]' WHERE n = 1")
+        self.db.commit()
+        self.assertEqual(cv.delete_versions(self.db, self.job, 2), [2])
+        self.assertEqual((radar.TAILORED_DIR / f"{self.token}.tex").read_text(), "text 1")
+        self.assertIn(b"text 1", (radar.TAILORED_DIR / f"{self.token}.pdf").read_bytes())
+        self.assertFalse(self.archived(2, "tex").exists())
+        tj = self.db.execute("SELECT state, pdf, warnings FROM tailor_jobs WHERE job_id = ?", (self.job,)).fetchone()
+        self.assertEqual((tj["state"], tj["pdf"], tj["warnings"]), ("done", 1, '["old"]'))
+        self.assertEqual(oct((radar.TAILORED_DIR / f"{self.token}.tex").stat().st_mode & 0o777), "0o600")
+
+    def test_previous_version_without_pdf_removes_the_stale_current_pdf(self):
+        self.write_current("tex only", pdf=False)
+        cv.snapshot_version(self.db, self.job, "devops", "de", [])
+        self.write_current("second")
+        cv.snapshot_version(self.db, self.job, "devops", "de", [])
+        cv.delete_versions(self.db, self.job, 2)
+        self.assertFalse((radar.TAILORED_DIR / f"{self.token}.pdf").exists())
+
+    def test_deleting_the_only_version_removes_the_resume_and_resets_the_job(self):
+        self.make(1)
+        self.db.execute("INSERT INTO tailor_jobs (job_id, state) VALUES (?, 'done')", (self.job,))
+        self.db.commit()
+        self.assertEqual(cv.delete_versions(self.db, self.job, 1), [1])
+        self.assertFalse((radar.TAILORED_DIR / f"{self.token}.tex").exists() or (radar.TAILORED_DIR / f"{self.token}.pdf").exists())
+        self.assertIsNone(self.db.execute("SELECT 1 FROM tailor_jobs WHERE job_id = ?", (self.job,)).fetchone())
+
+    def test_a_previous_version_with_missing_files_blocks_the_deletion_and_changes_nothing(self):
+        self.make(2)
+        self.archived(1, "tex").unlink()
+        with self.assertRaises(ValueError):
+            cv.delete_versions(self.db, self.job, 2)
+        self.assertEqual([r["n"] for r in self.rows()], [1, 2])
+        self.assertEqual((radar.TAILORED_DIR / f"{self.token}.tex").read_text(), "text 2")
 
     def test_delete_with_nothing_archived_is_an_error(self):
         with self.assertRaises(ValueError):

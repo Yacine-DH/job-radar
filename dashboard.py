@@ -374,26 +374,103 @@ def md_blocks(lines: list[str]) -> str:
     return "".join(out)
 
 
+SEVERITY_RE = re.compile(r"\(\s*(critical|important|nice[- ]to[- ]have|minor)\b([^)]*)\)", re.I)
+HOURS_RE = re.compile(r"\bAbout\s+(\d+(?:\s*[\u2013-]\s*\d+)?)\s*h\b\.?", re.I)
+
+
+def split_gap(text: str) -> tuple[str, str, str]:
+    """One gap bullet -> (severity, headline, detail). Severity is 'crit', 'nice' or ''."""
+    sev = ""
+    m = SEVERITY_RE.search(text)
+    if m:
+        sev = "crit" if m.group(1).lower() in ("critical", "important") else "nice"
+        rest = m.group(2).strip(" ;,:")
+        text = re.sub(r"\s+([.,;:])", r"\1", text[:m.start()] + (f"({rest})" if rest else "") + text[m.end():]).strip()
+    head, _, detail = text.partition(". ")
+    return sev, head.rstrip(".").strip(), detail.strip()
+
+
+def md_items(lines: list[str]) -> list[str]:
+    return [m.group(1) for ln in lines if (m := re.match(r"^\s*(?:[-*]|\d+[.)])\s+(.*)", ln))]
+
+
+def render_gaps_block(lines: list[str]) -> str:
+    cards = []
+    for raw in md_items(lines):
+        sev, head, detail = split_gap(raw)
+        tag = {"crit": '<span class="tag crit">critical</span>', "nice": '<span class="tag nice">nice to have</span>'}.get(sev, "")
+        cards.append(f'<li class="gapcard {sev}">{icon("alert", 16)}<div><strong>{inline(e(head))}</strong>{tag}'
+                     + (f'<p>{inline(e(detail))}</p>' if detail else "") + "</div></li>")
+    return f'<ul class="gapcards">{"".join(cards)}</ul>' if cards else ""
+
+
+def render_matches_block(lines: list[str]) -> str:
+    rows = []
+    for raw in md_items(lines):
+        req, arrow, ev = raw.partition(" -> ")
+        if not arrow:
+            rows.append(f'<li class="match">{icon("check", 15, 2.6)}<div>{inline(e(raw))}</div></li>')
+            continue
+        rows.append(f'<li class="match">{icon("check", 15, 2.6)}<div><strong>{inline(e(req.replace("**", "")))}</strong>'
+                    f'<span>{inline(e(ev))}</span></div></li>')
+    return f'<ul class="matches">{"".join(rows)}</ul>' if rows else ""
+
+
+def render_learn_block(lines: list[str]) -> str:
+    steps = []
+    for i, raw in enumerate(md_items(lines), 1):
+        hm = HOURS_RE.search(raw)
+        hours = f'<span class="hours">{e(hm.group(1).replace(" ", ""))} h</span>' if hm else ""
+        body = HOURS_RE.sub("", raw).strip()
+        title, sep, detail = body.partition(":")
+        if sep and title.startswith("**") and title.endswith("**"):
+            title, detail = title.strip("*"), detail.strip()
+        else:
+            title, detail = "", body
+        steps.append(f'<li class="step"><span class="num">{i}</span><div>' + (f"<strong>{e(title)}</strong>" if title else "")
+                     + f'<p>{inline(e(detail))}</p></div>{hours}</li>')
+    return f'<ol class="steps">{"".join(steps)}</ol>' if steps else ""
+
+
 def render_fit(md: str, bnd: str) -> str:
-    """Fit analysis markdown: small uppercase labels, tinted Verdict, bullet/numbered lists, hook as a quote."""
-    sections: list[list] = []
+    """Fit analysis markdown as components: verdict callout, skill gaps first (amber cards with severity), matches as
+    requirement/evidence rows, numbered learning steps with hours, CV tailoring collapsed, hook as a quote."""
+    sections: list[tuple[str, list[str]]] = []
     for line in md.splitlines():
         if line.startswith("## "):
-            sections.append([line[3:].strip(), []])
+            sections.append((line[3:].strip(), []))
         elif sections:
             sections[-1][1].append(line)
     if not sections:
         return f'<div class="md">{md_blocks(md.splitlines())}</div>'
+    order = {"verdict": 0, "gaps": 1, "what matches": 2, "learn first": 3, "cv tailoring": 4, "application hook": 5}
     out = []
-    for name, lines in sections:
+    for name, lines in sorted(sections, key=lambda sec: order.get(sec[0].lower(), 3.5)):
         key, body = name.lower(), " ".join(x.strip() for x in lines if x.strip())
         if key.startswith("verdict"):
             out.append(f'<div class="verdict {bnd if bnd != "none" else "lo"}"><strong>Verdict</strong> · {inline(e(body))}</div>')
         elif key.startswith("application hook"):
             out.append(f'<div><h4>{e(name)}</h4><blockquote>{inline(e(body))}</blockquote></div>')
+        elif key == "gaps" and (blk := render_gaps_block(lines)):
+            out.append(f'<div class="fitsec gaps"><h4>{icon("alert", 14)}Skill gaps</h4>{blk}</div>')
+        elif key == "what matches" and (blk := render_matches_block(lines)):
+            out.append(f'<div class="fitsec"><h4>{icon("check", 14, 2.6)}What matches</h4>{blk}</div>')
+        elif key == "learn first" and (blk := render_learn_block(lines)):
+            out.append(f'<div class="fitsec"><h4>{icon("chart", 14)}Learn first</h4>{blk}</div>')
+        elif key.startswith("cv tailoring"):
+            out.append(f'<details class="sub"><summary>{icon("chevron", 12, 2.4)}{e(name)}</summary>{md_blocks(lines)}</details>')
         else:
             out.append(f"<div><h4>{e(name)}</h4>{md_blocks(lines)}</div>")
     return '<div class="md">' + "".join(out) + "</div>"
+
+
+def fit_details(r, alone: bool = False) -> str:
+    """The collapsed 'Fit analysis' control; its label counts the skill gaps so they are visible before opening."""
+    gaps = job_gaps(r)
+    badge = f'<span class="gapcount">{len(gaps)} gap{"s" if len(gaps) != 1 else ""}</span>' if gaps else ""
+    inner = (f'<details class="fit"><summary>{icon("chevron", 14, 2.4)}Fit analysis &amp; what to learn{badge}</summary>'
+             f'{render_fit(r["tailoring_md"], band(r["score"]))}</details>')
+    return f'<div class="fitwrap{" alone" if alone else ""}">{inner}</div>'
 
 
 def split_warnings(raw: str | None) -> tuple[list[str], list[str], bool]:
@@ -431,8 +508,8 @@ def versions_for(con: sqlite3.Connection, ids: list[str] | None = None) -> dict[
 
 def render_history(r, versions: list, state: str | None) -> str:
     """Collapsed list of earlier resume versions: shown only when there is something older to look at.
-    Each older version can be edited (opens the Regenerate panel on it) or deleted; the newest cannot be deleted."""
-    if not (len(versions) >= 2 or (state == "failed" and versions)):
+    Each version can be edited (opens the Regenerate panel on it) or deleted, the current one included."""
+    if not versions or state not in ("done", "failed"):
         return ""
     token, latest, items = radar.file_token(r["id"]), int(versions[0]["n"]), []
     for v in versions:
@@ -447,9 +524,8 @@ def render_history(r, versions: list, state: str | None) -> str:
         links = (f'<a href="/files/{token}.v{n}.pdf" download aria-label="Download version {n} as PDF">PDF</a>' if v["pdf"] else "") + \
                 f'<a href="/files/{token}.v{n}.tex" download aria-label="Download version {n} LaTeX source">.tex</a>'
         edit = f'<button type="button" class="lnk muted" data-act="edit-version" data-n="{n}" aria-label="Edit version {n}">Edit…</button>'
-        dele = ("" if n == latest else
-                f'<button type="button" class="lnk del" data-act="resume-delete" data-n="{n}" data-pinned="{int(bool(v["keep"]))}" '
-                f'aria-label="Delete version {n}">Delete</button>')
+        dele = (f'<button type="button" class="lnk del" data-act="resume-delete" data-n="{n}" data-pinned="{int(bool(v["keep"]))}" '
+                f'data-cur="{int(n == latest)}" data-prev="{int(len(versions) > 1)}" aria-label="Delete version {n}">Delete</button>')
         items.append(f'<li><span class="vn">v{n}</span><span class="muted vm">{e(meta)}</span>{pin}{cur}'
                      f'<span class="vl">{edit}{links}{dele}</span></li>')
     older = ""
@@ -515,13 +591,11 @@ def render_tailor(r, versions: list | None = None) -> str:
                      "<ul>" + "".join(f"<li>{x}</li>" for x in items) + "</ul></div>")
         fit = ""
         if r["tailoring_md"]:
-            fit = (f'<div class="fitwrap"><details class="fit"><summary>{icon("chevron", 14, 2.4)}Fit analysis &amp; what to learn</summary>'
-                   f'{render_fit(r["tailoring_md"], band(r["score"]))}</details></div>')
+            fit = fit_details(r)
         box = (f'<section class="box done" aria-label="Tailored resume">{stamp}<div class="dl">{pdf}{tex}</div>{warn}{fit}'
                f'<div class="boxfoot">{render_regen(r, versions)}{render_history(r, versions or [], state)}</div></section>')
     elif r["tailoring_md"]:  # analysis made on the command line, no resume requested from the dashboard
-        box = (f'<div class="fitwrap alone"><details class="fit"><summary>{icon("chevron", 14, 2.4)}Fit analysis &amp; what to learn</summary>'
-               f'{render_fit(r["tailoring_md"], band(r["score"]))}</details></div>')
+        box = fit_details(r, alone=True)
     desc = (r["description"] or "").strip()
     details = ('<button type="button" class="lnk muted" data-act="details" aria-expanded="false">Posting details</button>'
                if desc else "<span></span>")
@@ -673,6 +747,20 @@ main{padding:8px 16px 24px;display:flex;flex-direction:column;gap:12px}
 .hist .vl a{display:inline-flex;align-items:center;min-height:40px;padding:0 8px}
 .hist .vl .lnk{padding:0 8px;font-size:13px}.hist .del,.lnk.del{color:var(--danger)}.hist>.lnk.del{margin-top:4px}
 .tag.keep{background:var(--accent-tint);color:var(--accent-fg)}
+.fit summary .gapcount{margin-left:8px;font-size:12px;font-weight:600;border-radius:999px;padding:1px 8px;background:var(--gap-tint);color:var(--gap-fg);border:1px solid var(--gap-line)}
+.fitsec h4{display:flex;align-items:center;gap:6px}.fitsec.gaps h4{color:var(--gap-fg)}
+.gapcards,.matches,.steps{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}
+.gapcard{display:flex;gap:10px;align-items:flex-start;background:var(--gap-tint);border:1px solid var(--gap-line);border-left:4px solid var(--gap-bar);border-radius:8px;padding:8px 10px}
+.gapcard.nice{border-left-color:var(--gap-line)}.gapcard .ic{color:var(--gap-fg);margin-top:2px;flex-shrink:0}
+.gapcard strong{font-weight:600}.gapcard p{margin:2px 0 0;color:var(--muted);font-size:13px}
+.match{display:flex;gap:10px;align-items:flex-start;padding:6px 0;border-top:1px solid var(--line)}.match:first-child{border-top:0}
+.match .ic{color:var(--hi-fg);margin-top:3px;flex-shrink:0}.match strong{display:block;font-weight:600}.match span{color:var(--muted);font-size:13px}
+.step{display:flex;gap:10px;align-items:flex-start;border:1px solid var(--line);border-radius:8px;padding:8px 10px}
+.step .num{flex-shrink:0;width:22px;height:22px;border-radius:50%;background:var(--accent-tint);color:var(--accent-fg);font-size:12px;font-weight:600;display:flex;align-items:center;justify-content:center;margin-top:1px}
+.step>div{flex:1;min-width:0}.step strong{font-weight:600}.step p{margin:2px 0 0;font-size:13px;color:var(--muted)}
+.step .hours{flex-shrink:0;font-size:12px;font-weight:600;border-radius:999px;padding:1px 8px;background:var(--card);border:1px solid var(--line);white-space:nowrap}
+.md details.sub summary{display:inline-flex;align-items:center;gap:6px;min-height:36px;cursor:pointer;color:var(--muted);font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;list-style:none}
+.md details.sub summary::-webkit-details-marker{display:none}.md details.sub[open] summary .ic{transform:rotate(90deg)}
 .boxfoot{display:flex;flex-wrap:wrap;align-items:flex-start;gap:0 16px}.boxfoot>details{flex:1 1 100%}
 .regen{font-size:13px}.regen summary{min-height:40px;display:inline-flex;align-items:center;gap:6px;color:var(--muted);cursor:pointer;list-style:none}
 .regen summary::-webkit-details-marker{display:none}.regen summary .ic{transition:transform .15s}.regen[open] summary{color:var(--fg)}.regen[open] summary .ic{transform:rotate(90deg)}
@@ -843,7 +931,8 @@ document.addEventListener('click',e=>{
       const box=a.closest('.regen'),notes=$('[data-f=notes]',box).value.trim(),base=$('[data-f=base]',box).value,label=$('[data-f=label]',box).value.trim();
       const o={notes,label};if(notes&&base!=='')o.base=+base;startTailor(c,o);}
     else if(a.dataset.act==='edit-version'&&c){const box=$('.regen',c);if(box){box.open=true;$('[data-f=base]',box).value=a.dataset.n;$('[data-f=notes]',box).focus();}}
-    else if(a.dataset.act==='resume-delete'&&c)deleteVersions(c,{n:+a.dataset.n},'Delete version v'+a.dataset.n+(a.dataset.pinned==='1'?' (pinned: you labelled it to keep it)':'')+'? This cannot be undone.');
+    else if(a.dataset.act==='resume-delete'&&c){const d=a.dataset;
+      deleteVersions(c,{n:+d.n},'Delete version v'+d.n+(d.pinned==='1'?' (pinned: you labelled it to keep it)':'')+(d.cur==='1'?(d.prev==='1'?', your CURRENT resume? The previous version becomes current':', your only resume? The resume for this job will be removed'):'? ')+'. This cannot be undone.');}
     else if(a.dataset.act==='resume-delete-older'&&c)deleteVersions(c,{all_older:true},'Delete all older versions except the newest and the pinned ones? This cannot be undone.');
     else if(a.dataset.act==='undo')doUndo();
     else if(a.dataset.act==='details'&&c){const d=$('.desc',c),open=d.hidden;d.hidden=!open;a.setAttribute('aria-expanded',String(open));}

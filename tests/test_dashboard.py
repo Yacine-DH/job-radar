@@ -52,7 +52,7 @@ class RenderingTests(unittest.TestCase):
         self.assertIn("&lt;script&gt;", out)
         self.assertIn('class="verdict hi"', out)
         self.assertIn('tag crit', out)
-        self.assertIn("<ol>", out)
+        self.assertIn('<ol class="steps">', out)
 
     def test_tailor_slot_states(self):
         base = Row(id="t:1", score=78, description="x", tailoring_md=None)
@@ -145,8 +145,10 @@ class HistoryRenderingTests(unittest.TestCase):
         self.assertIn(".v2.tex", out)
         self.assertEqual(out.count(">current</span>"), 1)  # only the newest is tagged
 
-    def test_no_history_control_when_there_is_only_one_version(self):
-        self.assertNotIn("hist", self.done([self.v(1)]))
+    def test_history_appears_for_a_single_version_so_it_can_be_deleted_but_never_on_an_idle_card(self):
+        h = self.done([self.v(1)])
+        self.assertIn("History (1)", h)
+        self.assertIn('data-act="resume-delete" data-n="1"', h)
         self.assertNotIn("hist", self.done([]))
         self.assertNotIn("hist", d.render_tailor(Row(id="t:1", score=5), [self.v(1), self.v(2)]))  # idle card
 
@@ -195,11 +197,13 @@ class HistoryControlsTests(unittest.TestCase):
         return d.render_tailor(Row(id="t:1", score=78, tj_state="done", tj_pdf=1, tj_warnings="[]",
                                    tj_finished="2026-11-24 16:14:00"), versions)
 
-    def test_newest_version_has_no_delete_button_older_ones_do(self):
+    def test_every_version_can_be_deleted_and_the_current_one_is_marked_so(self):
         h = self.html([self.v(3), self.v(2), self.v(1)])
-        self.assertNotIn('data-act="resume-delete" data-n="3"', h)
-        self.assertIn('data-act="resume-delete" data-n="2"', h)
-        self.assertIn('data-act="resume-delete" data-n="1"', h)
+        for n in (1, 2, 3):
+            self.assertIn(f'data-act="resume-delete" data-n="{n}"', h)
+        self.assertIn('data-n="3" data-pinned="0" data-cur="1" data-prev="1"', h)
+        self.assertIn('data-n="2" data-pinned="0" data-cur="0"', h)
+        self.assertIn('data-n="1" data-pinned="0" data-cur="1" data-prev="0"', self.html([self.v(1)]))
         self.assertIn("resume-delete-older", h)
 
     def test_labels_are_shown_escaped_and_the_bulk_button_hides_when_only_pinned_remain(self):
@@ -212,6 +216,112 @@ class HistoryControlsTests(unittest.TestCase):
         h = self.html([self.v(2), self.v(1)])
         self.assertIn('<option value="2" selected>', h)
         self.assertIn("Master CV (start fresh)", h)
+
+
+class DemoTests(unittest.TestCase):
+    """demo.py seeds made-up data into a throwaway database: it must stay consistent with the schema and the renderers."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        import demo
+        self._keep = fresh_db()
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old = radar.TAILORED_DIR
+        radar.TAILORED_DIR = Path(self._tmp.name)
+        self.demo = demo
+        self.db = radar.open_db()
+        demo.seed(radar, self.db)
+
+    def tearDown(self):
+        self.db.close()
+        radar.TAILORED_DIR = self._old
+        self._tmp.cleanup()
+
+    def test_seed_creates_jobs_a_fit_analysis_and_three_resume_versions_with_files(self):
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], len(self.demo.JOBS))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM resume_versions WHERE job_id = 'demo:1'").fetchone()[0], 3)
+        token = radar.file_token("demo:1")
+        for n in (1, 2, 3):
+            self.assertTrue(radar.version_path(token, n, "tex").exists() and radar.version_path(token, n, "pdf").exists())
+
+    def test_the_card_of_the_demo_job_renders_gaps_history_and_the_pinned_label(self):
+        row = self.db.execute(d.ROW_SQL + " WHERE jobs.id = 'demo:1'").fetchone()
+        with d.db() as con:
+            versions = d.versions_for(con, ["demo:1"])["demo:1"]
+        html = d.render_tailor(row, versions) + d.fit_details(row)
+        for needle in ("gapcard crit", "2 gaps", "History (3)", 'class="tag keep">final', 'data-act="resume-delete" data-n="1"'):
+            self.assertIn(needle, html)
+
+    def test_the_demo_contains_no_real_personal_data(self):
+        blob = " ".join(str(v) for r in self.db.execute("SELECT * FROM jobs") for v in tuple(r)) + self.demo.FIT
+        for forbidden in ("@", "gmail", "Darmstadt, Germany"):
+            self.assertNotIn(forbidden, blob)
+
+
+class FitPanelTests(unittest.TestCase):
+    MD = """## Verdict
+Good fit.
+
+## What matches
+- **Python** -> five years of it
+- plain bullet without arrow
+
+## Gaps
+- Kubernetes is not in the CV. The posting says containers (nice-to-have).
+- No AWS experience (critical to clarify, not a skill gap).
+
+## Learn first
+1. **Kubernetes basics**: run k3s on the server. About 8\u201312 h.
+2. Just read a book.
+
+## CV tailoring
+Variant: devops.
+
+## Application hook
+Hello <b>there</b>.
+"""
+
+    def html(self):
+        return d.render_fit(self.MD, "hi")
+
+    def test_gaps_come_right_after_the_verdict_before_the_matches(self):
+        h = self.html()
+        self.assertLess(h.index("Skill gaps"), h.index("What matches"))
+        self.assertLess(h.index("verdict"), h.index("Skill gaps"))
+        self.assertLess(h.index("What matches"), h.index("Learn first"))
+
+    def test_gaps_are_cards_with_severity_headline_and_detail(self):
+        h = self.html()
+        self.assertIn('class="gapcard nice"', h)
+        self.assertIn('class="gapcard crit"', h)
+        self.assertIn("<strong>Kubernetes is not in the CV</strong>", h)
+        self.assertIn("The posting says containers", h)
+        self.assertIn("(to clarify, not a skill gap)", h)  # the explanation survives, only the keyword became a tag
+        self.assertIn("The posting says containers.", h)  # no stray space where the tag was
+        self.assertNotIn("(nice-to-have)", h)
+
+    def test_matches_and_learning_steps_are_parsed_with_a_graceful_fallback(self):
+        h = self.html()
+        self.assertIn("<strong>Python</strong><span>five years of it</span>", h)
+        self.assertIn("plain bullet without arrow", h)
+        self.assertIn('<span class="hours">8\u201312 h</span>', h)
+        self.assertIn("<strong>Kubernetes basics</strong>", h)
+        self.assertIn("Just read a book.", h)
+
+    def test_everything_is_escaped_and_cv_tailoring_is_collapsed(self):
+        h = self.html()
+        self.assertNotIn("<b>there</b>", h)
+        self.assertIn("&lt;b&gt;there&lt;/b&gt;", h)
+        self.assertIn('<details class="sub">', h)
+
+    def test_unstructured_text_still_renders(self):
+        self.assertIn("plain", d.render_fit("plain text only", "mid"))
+
+    def test_the_summary_counts_the_job_gaps(self):
+        r = Row(id="t:1", score=70, tailoring_md=self.MD, gaps='["Kubernetes", "Terraform"]')
+        self.assertIn("2 gaps", d.fit_details(r))
+        self.assertNotIn("gapcount", d.fit_details(Row(id="t:1", score=70, tailoring_md=self.MD, gaps="[]")))
 
 
 if __name__ == "__main__":
