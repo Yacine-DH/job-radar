@@ -80,7 +80,11 @@ ask the owner which one to use. (An earlier version hard-coded the address in th
 ## Data model (`jobs.db`)
 `jobs` (id `source:ref`, score, reason, cv_track swe|devops|ml, gaps JSON, status new|interested|applied|
 not_relevant, notified, distance_km...), `tailoring` (markdown analysis per job), `tailor_jobs` (queue:
-queued|running|done|failed, pdf flag, warnings JSON), `resume_versions` (every successful resume generation is
+queued|running|done|failed, pdf flag, warnings JSON, `started` = when the worker picked it up), `meta` (key/value; the
+worker writes `worker_heartbeat` every 10 s from a separate thread, so a long job never looks offline: the dashboard shows
+"Worker offline since HH:MM" after 45 s without a beat and "Taking longer than expected" after 5 min; `running` rows older
+than 15 min are re-queued; `POST /api/tailor/cancel` restores the previous resume state, refused while a live worker is on
+it; the clock is injectable in `radar.worker_age/requeue_stale` and `cv.cancel_request`), `resume_versions` (every successful resume generation is
 archived as `cv/tailored/<token>.v<N>.tex|pdf`, last 10 kept, lazy v1 backfill before the first overwrite; the dashboard
 shows a collapsed **History (N)** control), `runs` (one row per real daily run: per-source counts and
 failed sources, shown in the dashboard header/sidebar; dry runs do not write it). Ranking prompts include the

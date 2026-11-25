@@ -96,6 +96,8 @@ def seed(radar, db) -> None:
     for ext, data in (("tex", b"% demo placeholder\n"), ("pdf", MINIMAL_PDF)):
         (radar.TAILORED_DIR / f"{token}.{ext}").write_bytes(data)
     db.execute("INSERT INTO tailor_jobs (job_id, state, pdf, warnings, finished) VALUES ('demo:1', 'done', 1, '[]', ?)", (ts(),))
+    # A request nobody is working on: the demo has no worker, so the card shows the "Worker offline" state with Cancel.
+    db.execute("INSERT INTO tailor_jobs (job_id, state, requested) VALUES ('demo:4', 'queued', ?)", (ts(hours=0.15),))
     db.execute("INSERT INTO runs (ts, counts, failed) VALUES (?, ?, '[]')",
                (ts(hours=1), json.dumps({"BA": 41, "Stellenwerk": 9, "Merck": 3, "Arbeitnow": 12, "SmartRecruiters": 5})))
     db.commit()

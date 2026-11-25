@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from unittest import mock
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from tests.helpers import ROOT, fresh_db, radar  # noqa: F401  (ROOT puts the project on sys.path)
@@ -381,6 +381,68 @@ class EditModeTests(ResumeLoopTests):
         self.assertEqual(self.gen.call_args.args[5].strip()[:20], ("% role=devops lang=de")[:20])  # base= the archived body
         row = self.db.execute("SELECT label, keep FROM resume_versions WHERE n = 2").fetchone()
         self.assertEqual((row["label"], row["keep"]), ("final", 1))
+
+
+class CancelRequestTests(unittest.TestCase):
+    NOW = datetime(2026, 11, 16, 12, 0, 0, tzinfo=timezone.utc)
+
+    def setUp(self):
+        self._keep = fresh_db()
+        self.db = radar.open_db()
+        self.job = "t:1"
+
+    def tearDown(self):
+        self.db.close()
+
+    def pending(self, state, started=None):
+        self.db.execute("INSERT OR REPLACE INTO tailor_jobs (job_id, state, started) VALUES (?, ?, ?)",
+                        (self.job, state, None if started is None else radar.ts_str(started)))
+        self.db.commit()
+
+    def row(self):
+        return self.db.execute("SELECT state, pdf, warnings, finished, error FROM tailor_jobs WHERE job_id = ?", (self.job,)).fetchone()
+
+    def test_cancelling_a_queued_regeneration_restores_the_previous_resume(self):
+        self.db.execute("INSERT INTO resume_versions (job_id, n, created, pdf, warnings) VALUES (?, 1, '2026-11-01 09:00:00', 1, '[\"w\"]')", (self.job,))
+        self.pending("queued")
+        self.assertEqual(cv.cancel_request(self.db, self.job, self.NOW), "cancelled")
+        r = self.row()
+        self.assertEqual((r["state"], r["pdf"], r["warnings"], r["finished"], r["error"]), ("done", 1, '["w"]', "2026-11-01 09:00:00", None))
+        self.assertFalse(self.db.in_transaction)
+
+    def test_cancelling_a_first_request_removes_it_so_the_card_is_idle_again(self):
+        self.pending("queued")
+        cv.cancel_request(self.db, self.job, self.NOW)
+        self.assertIsNone(self.row())
+
+    def test_a_live_worker_on_a_fresh_running_request_cannot_be_cancelled(self):
+        radar.beat(self.db, self.NOW)
+        self.pending("running", self.NOW)
+        with self.assertRaises(ValueError) as ctx:
+            cv.cancel_request(self.db, self.job, self.NOW)
+        self.assertIn("worker is on it", str(ctx.exception))
+        self.assertEqual(self.row()["state"], "running")
+        self.assertFalse(self.db.in_transaction)
+
+    def test_a_running_request_can_be_cancelled_when_the_worker_is_offline_or_overdue(self):
+        self.pending("running", self.NOW)                                    # the worker never reported: offline
+        cv.cancel_request(self.db, self.job, self.NOW)
+        self.assertIsNone(self.row())
+        radar.beat(self.db, self.NOW)                                        # alive, but the request is overdue
+        self.pending("running", self.NOW - timedelta(seconds=radar.RUNNING_STALE_SECONDS + 1))
+        cv.cancel_request(self.db, self.job, self.NOW)
+        self.assertIsNone(self.row())
+        self.pending("running", None)                                        # started unknown + live worker counts as overdue
+        cv.cancel_request(self.db, self.job, self.NOW)
+        self.assertIsNone(self.row())
+
+    def test_nothing_pending_is_an_error_and_done_requests_are_untouched(self):
+        with self.assertRaises(ValueError):
+            cv.cancel_request(self.db, self.job, self.NOW)
+        self.pending("done")
+        with self.assertRaises(ValueError):
+            cv.cancel_request(self.db, self.job, self.NOW)
+        self.assertEqual(self.row()["state"], "done")
 
 
 class PrivateLinkTests(unittest.TestCase):
