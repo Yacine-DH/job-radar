@@ -26,7 +26,9 @@ repo with the unscrubbed history is archived as `Yacine-DH/job-radar-archive`.
 - `demo.py` - the real dashboard on made-up data in a temp dir (`.venv/bin/python demo.py`, `--snapshot FILE`); also used
   by the tests. `LICENSE` is MIT.
 - `tests/` - stdlib `unittest`, fake data only, never touches the real DB/CV/network:
-  `.venv/bin/python -m unittest discover -s tests -t .` (run it after changing logic; add tests for new logic).
+  `.venv/bin/python -m tests` (run it after changing logic; add tests for new logic). Plain
+  `-W error::ResourceWarning -m unittest` does NOT fail on a leaked connection (Python only prints "Exception ignored"); `-m tests`
+  does, and CI runs it.
 - `docs/design-brief.md` (brief for UI work) and `docs/design-handoff.md` (the redesign the dashboard follows).
 - `README.md` is for humans; this file is for Claude. `requirements.txt` lists the dashboard's dependencies.
 

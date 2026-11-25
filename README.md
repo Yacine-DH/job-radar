@@ -126,7 +126,7 @@ python3 -I cv.py recompile             # build missing PDFs from .tex files alre
 python3 -I cv.py skills                # most demanded skills your CV lacks
 journalctl --user -u job-radar.service # logs of the daily run
 
-.venv/bin/python -m unittest discover -s tests -t .    # tests
+.venv/bin/python -m tests                             # all tests, also fails on leaked connections (CI runs exactly this)
 ```
 
 ## Configuration (`.env`)
