@@ -407,6 +407,18 @@ def set_label(db: sqlite3.Connection, job_id: str, n: int, label: str) -> None:
     db.commit()
 
 
+def _stage_copy(src: Path, directory: Path) -> Path:
+    """Copy `src` to a private temp file in `directory` and return its path (the caller renames it into place)."""
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".stage.")
+    try:
+        with os.fdopen(fd, "wb") as out, open(src, "rb") as inp:
+            shutil.copyfileobj(inp, out)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    return Path(tmp)
+
+
 def delete_versions(db: sqlite3.Connection, job_id: str, n: int | None = None, all_older: bool = False) -> list[int]:
     """Delete archived versions; `all_older` skips the newest and pinned (labelled) versions. Deleting the newest
     version (the current resume) makes the previous one current again, or, if it was the only one, removes the resume
@@ -415,6 +427,7 @@ def delete_versions(db: sqlite3.Connection, job_id: str, n: int | None = None, a
     serialize; files follow the commit: the promoted version is copied over the current names (atomic replace) and
     only then are the deleted archive files removed."""
     db.execute("BEGIN IMMEDIATE")
+    staged: list[Path] = []
     try:
         if db.execute("SELECT 1 FROM tailor_jobs WHERE job_id = ? AND state IN ('queued', 'running')", (job_id,)).fetchone():
             raise ValueError("a resume is being generated for this job: wait until it is done")
@@ -437,6 +450,7 @@ def delete_versions(db: sqlite3.Connection, job_id: str, n: int | None = None, a
             if not src_tex.exists():
                 raise ValueError(f"version {prev['n']} has no files any more, so it cannot become current")
             promote = (src_tex, src_pdf if src_pdf.exists() else None)
+            staged = [_stage_copy(src, radar.TAILORED_DIR) for src in promote if src]  # may fail: nothing has changed yet
             db.execute("UPDATE tailor_jobs SET state = 'done', error = NULL, finished = ?, pdf = ?, warnings = ? WHERE job_id = ?",
                        (prev["created"], int(promote[1] is not None), prev["warnings"], job_id))
         elif newest in targets:  # the only version: the resume and the job's tailor state go away
@@ -446,12 +460,14 @@ def delete_versions(db: sqlite3.Connection, job_id: str, n: int | None = None, a
         db.commit()
     except BaseException:
         db.rollback()
+        for tmp in staged:
+            tmp.unlink(missing_ok=True)
         raise
     cur_tex, cur_pdf = radar.TAILORED_DIR / f"{token}.tex", radar.TAILORED_DIR / f"{token}.pdf"
-    if promote:
-        _private_copy(promote[0], cur_tex)
+    if promote:  # only renames are left after the commit
+        os.replace(staged[0], cur_tex)
         if promote[1]:
-            _private_copy(promote[1], cur_pdf)
+            os.replace(staged[1], cur_pdf)
         else:
             cur_pdf.unlink(missing_ok=True)
     elif newest in targets:

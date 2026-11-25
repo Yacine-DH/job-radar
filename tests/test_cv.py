@@ -479,6 +479,25 @@ class VersionHistoryTests(unittest.TestCase):
         self.assertEqual([r["n"] for r in self.rows()], [1, 2])  # nothing was deleted; the transaction was rolled back
         self.assertFalse(self.db.in_transaction)
 
+    def test_a_copy_failure_while_promoting_changes_nothing_and_leaves_no_temp_files(self):
+        self.make(2)
+        with mock.patch.object(cv, "_stage_copy", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                cv.delete_versions(self.db, self.job, 2)
+        self.assertEqual([r["n"] for r in self.rows()], [1, 2])
+        self.assertEqual((radar.TAILORED_DIR / f"{self.token}.tex").read_text(), "text 2")
+        self.assertFalse(self.db.in_transaction)
+
+    def test_staged_files_are_private_and_gone_after_a_successful_promotion(self):
+        self.make(2)
+        cv.delete_versions(self.db, self.job, 2)
+        self.assertEqual([p.name for p in radar.TAILORED_DIR.glob(".stage.*")], [])
+        self.assertEqual(oct((radar.TAILORED_DIR / f"{self.token}.pdf").stat().st_mode & 0o777), "0o600")
+
+    def test_the_label_pattern_is_anchored_at_both_ends_even_for_search(self):
+        self.assertIsNone(radar.LABEL_RE.search("bad/../foo"))
+        self.assertIsNone(radar.LABEL_RE.search("\nvalid"))
+
     def test_a_trailing_newline_is_not_a_valid_label(self):
         self.make(1)
         for bad in ("final\n", "\nfinal"):

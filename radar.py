@@ -530,7 +530,7 @@ TAILORED_DIR = CV_DIR / "tailored"  # generated resumes (git-ignored with cv/)
 
 
 KEEP_VERSIONS = 10  # unpinned archived resume versions kept per job (a labelled version is pinned and never pruned)
-LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _.-]{0,23}\Z")  # a version label such as "final"
+LABEL_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9 _.-]{0,23}\Z")  # a version label such as "final"
 
 
 def version_path(token: str, n: int, ext: str) -> Path:

@@ -136,8 +136,22 @@ def check_tailor_options(con: sqlite3.Connection, job_id: str, notes: str, base:
     return None
 
 
+def busy(exc: sqlite3.OperationalError):
+    """A locked database is a retryable 503, not a crash; anything else is a real error."""
+    if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+        return JSONResponse({"error": "the database is busy, try again in a moment"}, status_code=503)
+    raise exc
+
+
 @app.post("/api/tailor")
 async def request_tailor(body: TailorRequest, request: Request):
+    try:
+        return await _request_tailor(body, request)
+    except sqlite3.OperationalError as exc:
+        return busy(exc)
+
+
+async def _request_tailor(body: TailorRequest, request: Request):
     origin = request.headers.get("origin")
     if origin and urlsplit(origin).netloc.lower() not in allowed_hosts():
         return JSONResponse({"error": "bad origin"}, status_code=403)
@@ -172,7 +186,14 @@ class DeleteVersions(BaseModel):
 
 @app.post("/api/resume/delete")
 async def delete_resume_versions(body: DeleteVersions, request: Request):
-    """Delete older archived resume versions (never the newest; pinned ones only one by one)."""
+    try:
+        return await _delete_resume_versions(body, request)
+    except sqlite3.OperationalError as exc:
+        return busy(exc)
+
+
+async def _delete_resume_versions(body: DeleteVersions, request: Request):
+    """Delete archived resume versions (the current one too: the previous version takes its place)."""
     origin = request.headers.get("origin")
     if origin and urlsplit(origin).netloc.lower() not in allowed_hosts():
         return JSONResponse({"error": "bad origin"}, status_code=403)
@@ -375,7 +396,7 @@ def md_blocks(lines: list[str]) -> str:
 
 SEVERITY_RE = re.compile(r"\(\s*(critical|important|nice[- ]to[- ]have|minor)\b([^)]*)\)", re.I)
 HOURS_RE = re.compile(r"\bAbout\s+(\d+(?:\s*[\u2013-]\s*\d+)?)\s*h\b\.?", re.I)
-ABBREV = ("e.g", "i.e", "vs", "etc", "z.B", "z. B", "d.h", "ca", "approx", "incl", "bzw", "inkl", "usw")
+ABBREV_RE = re.compile(r"(?:^|[\s(/])(?:e\.g|i\.e|vs|etc|d\.h|ca|approx|incl|bzw|inkl|usw|z\.\s?b)$", re.I)
 
 
 def first_sentence_end(text: str) -> int:
@@ -387,7 +408,7 @@ def first_sentence_end(text: str) -> int:
         elif ch == ")":
             depth = max(0, depth - 1)
         elif ch == "." and depth == 0 and text[i + 1:i + 2] == " " and text[:i].count("**") % 2 == 0:
-            if not text[:i].lower().endswith(ABBREV) and not re.search(r"(?:^|\s)\w$", text[:i]):
+            if not ABBREV_RE.search(text[:i]) and not re.match(r"[A-Za-z]\.", text[i + 2:]):  # "z. B." / "e. g." initials
                 return i
     return -1
 
@@ -405,11 +426,12 @@ def split_gap(text: str) -> tuple[str, str, str]:
     return sev, head.rstrip(".").strip(), detail.strip()
 
 
-def md_items(lines: list[str]) -> tuple[list[str], list[str]]:
-    """(list items, other prose lines). A line right after an item that is not itself an item continues that item
-    (wrapped bullets); prose before the first item, or after a blank line, is returned separately so nothing is lost."""
+def md_items(lines: list[str]) -> tuple[list[str], list[str], list[str]]:
+    """(list items, prose before the first item, prose after it). A non-item line right after an item continues that
+    item (wrapped bullets); other prose is kept, before or after the list as it was written, so nothing is lost."""
     items: list[str] = []
-    prose: list[str] = []
+    lead: list[str] = []
+    tail: list[str] = []
     after_item = False
     for ln in lines:
         m = re.match(r"^\s*(?:[-*]|\d+[.)])\s+(.*)", ln)
@@ -421,8 +443,8 @@ def md_items(lines: list[str]) -> tuple[list[str], list[str]]:
         elif after_item:
             items[-1] += " " + ln.strip()
         else:
-            prose.append(ln.strip())
-    return items, prose
+            (tail if items else lead).append(ln.strip())
+    return items, lead, tail
 
 
 def prose_html(prose: list[str]) -> str:
@@ -430,17 +452,17 @@ def prose_html(prose: list[str]) -> str:
 
 
 def render_gaps_block(lines: list[str]) -> str:
-    cards, (items, prose) = [], md_items(lines)
+    cards, (items, lead, tail) = [], md_items(lines)
     for raw in items:
         sev, head, detail = split_gap(raw)
         tag = {"crit": '<span class="tag crit">critical</span>', "nice": '<span class="tag nice">nice to have</span>'}.get(sev, "")
         cards.append(f'<li class="gapcard {sev}">{icon("alert", 16)}<div><strong>{inline(e(head))}</strong>{tag}'
                      + (f'<p>{inline(e(detail))}</p>' if detail else "") + "</div></li>")
-    return prose_html(prose) + f'<ul class="gapcards">{"".join(cards)}</ul>' if cards else ""
+    return prose_html(lead) + f'<ul class="gapcards">{"".join(cards)}</ul>' + prose_html(tail) if cards else ""
 
 
 def render_matches_block(lines: list[str]) -> str:
-    rows, (items, prose) = [], md_items(lines)
+    rows, (items, lead, tail) = [], md_items(lines)
     for raw in items:
         req, arrow, ev = raw.partition(" -> ")
         if not arrow:
@@ -448,15 +470,18 @@ def render_matches_block(lines: list[str]) -> str:
             continue
         rows.append(f'<li class="match">{icon("check", 15, 2.6)}<div><strong>{inline(e(req.replace("**", "")))}</strong>'
                     f'<span>{inline(e(ev))}</span></div></li>')
-    return prose_html(prose) + f'<ul class="matches">{"".join(rows)}</ul>' if rows else ""
+    return prose_html(lead) + f'<ul class="matches">{"".join(rows)}</ul>' + prose_html(tail) if rows else ""
 
 
 def render_learn_block(lines: list[str]) -> str:
-    steps, (items, prose) = [], md_items(lines)
+    steps, (items, lead, tail) = [], md_items(lines)
     for i, raw in enumerate(items, 1):
         hm = HOURS_RE.search(raw)
         hours = f'<span class="hours">{e(hm.group(1).replace(" ", ""))} h</span>' if hm else ""
-        body = re.sub(r"\(\s*\)", "", (raw[:hm.start()] + raw[hm.end():]) if hm else raw).strip()  # only the shown estimate leaves the text
+        body = raw
+        if hm:  # only the shown estimate leaves the text, and the parentheses that wrapped it
+            before, after = raw[:hm.start()].rstrip(), raw[hm.end():].lstrip()
+            body = (before[:-1].rstrip() + " " + after[1:].lstrip() if before.endswith("(") and after.startswith(")") else raw[:hm.start()] + raw[hm.end():]).strip()
         title, sep, detail = body.partition(":")
         if sep and title.startswith("**") and title.endswith("**"):
             title, detail = title.strip("*"), detail.strip()
@@ -464,7 +489,7 @@ def render_learn_block(lines: list[str]) -> str:
             title, detail = "", body
         steps.append(f'<li class="step"><span class="num">{i}</span><div>' + (f"<strong>{e(title)}</strong>" if title else "")
                      + f'<p>{inline(e(detail))}</p></div>{hours}</li>')
-    return prose_html(prose) + f'<ol class="steps">{"".join(steps)}</ol>' if steps else ""
+    return prose_html(lead) + f'<ol class="steps">{"".join(steps)}</ol>' + prose_html(tail) if steps else ""
 
 
 def render_fit(md: str, bnd: str) -> str:

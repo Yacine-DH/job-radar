@@ -351,6 +351,18 @@ class RouteTests(unittest.TestCase):
         self.assertEqual((radar.TAILORED_DIR / f"{self.token}.tex").read_bytes(), b"v1")  # v1 is current again
 
 
+    def test_a_locked_database_is_a_503_not_a_crash(self):
+        from unittest import mock
+        err = sqlite3.OperationalError("database is locked")
+        with mock.patch.object(d, "_request_tailor", side_effect=err):
+            self.assertEqual(self.call(d.request_tailor, d.TailorRequest(id="t:1"))[0], 503)
+        with mock.patch.object(d.cv, "delete_versions", side_effect=err):
+            self.assertEqual(self.call(d.delete_resume_versions, d.DeleteVersions(id="t:1", n=1))[0], 503)
+        with mock.patch.object(d, "_request_tailor", side_effect=sqlite3.OperationalError("no such table: x")):
+            with self.assertRaises(sqlite3.OperationalError):
+                self.call(d.request_tailor, d.TailorRequest(id="t:1"))
+
+
 class MigrationTests(unittest.TestCase):
     def test_an_old_database_gains_the_new_columns_and_keeps_its_rows(self):
         from pathlib import Path
@@ -455,6 +467,25 @@ Hello <b>there</b>.
         self.assertIn("About 4 h", h)
         self.assertNotIn("()", h)
 
+
+    def test_abbreviation_matching_has_word_boundaries_and_handles_german_forms(self):
+        self.assertEqual(d.split_gap("Fehlt z.B. Kubernetes. Mehr Details.")[1:], ("Fehlt z.B. Kubernetes", "Mehr Details."))
+        self.assertEqual(d.split_gap("Fehlt z. B. Docker. Rest.")[1], "Fehlt z. B. Docker")
+        self.assertEqual(d.split_gap("No experience managing a read replica. Add a DB project.")[1:],
+                         ("No experience managing a read replica", "Add a DB project."))
+        self.assertEqual(d.split_gap("Worked with CSVs. Need Parquet.")[1], "Worked with CSVs")
+        self.assertEqual(d.split_gap("No production experience with C. Add a systems project.")[1], "No production experience with C")
+
+    def test_empty_parentheses_in_code_survive_and_only_the_wrapping_ones_go(self):
+        h = d.render_learn_block(["1. **Async**: practice asyncio.run() and main(). About 3 h."])
+        self.assertIn("asyncio.run() and main()", h)
+        h = d.render_learn_block(["1. **K8s**: install k3s (About 2 h) and deploy."])
+        self.assertIn("install k3s and deploy", h)
+        self.assertNotIn("()", h)
+
+    def test_a_closing_note_stays_after_the_list(self):
+        h = d.render_gaps_block(["- Gap one (nice-to-have)", "", "Overall these are minor."])
+        self.assertLess(h.index("gapcard"), h.index("Overall these are minor."))
 
     def test_unstructured_text_still_renders(self):
         self.assertIn("plain", d.render_fit("plain text only", "mid"))
