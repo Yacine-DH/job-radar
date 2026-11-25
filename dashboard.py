@@ -708,6 +708,7 @@ def render_card(r, hidden: bool = False, versions: list | None = None) -> str:
     else:
         where = f'<span>{e(loc) + " · " if loc else ""}distance unknown</span>'
     gaps = job_gaps(r)
+    also = radar.parse_also_on(r["also_on"])
     cv_bits = []
     if r["cv_track"]:
         cv_bits.append(f'<span class="muted">CV <strong>{e(r["cv_track"])}</strong>{" · missing" if gaps else ""}</span>')
@@ -722,7 +723,7 @@ data-source="{e(r['source'] or '', quote=True)}" data-status="{e(r['status'], qu
 data-first="{e(r['first_seen'] or '', quote=True)}"{' hidden' if hidden else ''}>
   <div class="head">{badge}<div class="ttl"><a class="title" href="{e(safe_url(r['url']), quote=True)}" target="_blank" rel="noopener noreferrer">{e(title)}</a>{'<span class="pill">NEW</span>' if fresh else ''}<span class="co">{e(r['company'] or '')}</span></div></div>
   <div class="rest">
-    <div class="meta">{where}<span>{e(r['source'] or '')}</span><span>{e(fmt_day(r['first_seen']))}</span></div>
+    <div class="meta">{where}<span>{e(r['source'] or '')}</span>{f'<span class="muted">also on {e(", ".join(also))}</span>' if also else ''}<span>{e(fmt_day(r['first_seen']))}</span></div>
     <p class="reason{' muted' if score is None else ''}">{e(reason)}</p>
     {cv_line}
     {render_tailor(r, versions)}

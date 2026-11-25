@@ -248,8 +248,11 @@ class DemoTests(unittest.TestCase):
 
     def test_the_card_of_the_demo_job_renders_gaps_history_and_the_pinned_label(self):
         row = self.db.execute(d.ROW_SQL + " WHERE jobs.id = 'demo:1'").fetchone()
-        with d.db() as con:
+        con = d.db()
+        try:  # a `with` on a sqlite connection commits but does not close it
             versions = d.versions_for(con, ["demo:1"])["demo:1"]
+        finally:
+            con.close()
         html = d.render_tailor(row, versions) + d.fit_details(row)
         for needle in ("gapcard crit", "2 gaps", "History (3)", 'class="tag keep">final', 'data-act="resume-delete" data-n="1"'):
             self.assertIn(needle, html)
@@ -495,6 +498,23 @@ class MigrationTests(unittest.TestCase):
             radar.open_db().close()  # opening twice must not fail on the existing columns
         finally:
             db.close()
+
+
+class AlsoOnTests(unittest.TestCase):
+    def card(self, also):
+        return d.render_card(Row(id="t:1", title="x", status="new", score=60, first_seen="2026-01-01 00:00:00", source="BA", also_on=also))
+
+    def test_the_card_shows_the_other_sources_escaped(self):
+        h = self.card('["Stellenwerk", "<b>x</b>"]')
+        self.assertIn("also on Stellenwerk, &lt;b&gt;x&lt;/b&gt;", h)
+
+    def test_no_label_without_entries_or_with_broken_json(self):
+        for v in (None, "[]", "not json", "null", "123", "true", '{"a": 1}', '"Stellenwerk"', '[""]', "[1, null]"):
+            self.assertNotIn("also on", self.card(v), v)
+
+    def test_parse_also_on_keeps_only_non_empty_strings_of_a_list(self):
+        self.assertEqual(radar.parse_also_on('["A", " ", "", 3, null, "B "]'), ["A", "B"])
+        self.assertEqual(radar.parse_also_on('"Stellenwerk"'), [])        # a bare string is not split into characters
 
 
 class FitPanelTests(unittest.TestCase):
