@@ -708,10 +708,7 @@ def render_card(r, hidden: bool = False, versions: list | None = None) -> str:
     else:
         where = f'<span>{e(loc) + " · " if loc else ""}distance unknown</span>'
     gaps = job_gaps(r)
-    try:
-        also = [str(x) for x in json.loads(r["also_on"] or "[]")]
-    except ValueError:
-        also = []
+    also = radar.parse_also_on(r["also_on"])
     cv_bits = []
     if r["cv_track"]:
         cv_bits.append(f'<span class="muted">CV <strong>{e(r["cv_track"])}</strong>{" · missing" if gaps else ""}</span>')

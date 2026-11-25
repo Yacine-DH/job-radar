@@ -509,8 +509,12 @@ class AlsoOnTests(unittest.TestCase):
         self.assertIn("also on Stellenwerk, &lt;b&gt;x&lt;/b&gt;", h)
 
     def test_no_label_without_entries_or_with_broken_json(self):
-        for v in (None, "[]", "not json"):
-            self.assertNotIn("also on", self.card(v))
+        for v in (None, "[]", "not json", "null", "123", "true", '{"a": 1}', '"Stellenwerk"', '[""]', "[1, null]"):
+            self.assertNotIn("also on", self.card(v), v)
+
+    def test_parse_also_on_keeps_only_non_empty_strings_of_a_list(self):
+        self.assertEqual(radar.parse_also_on('["A", " ", "", 3, null, "B "]'), ["A", "B"])
+        self.assertEqual(radar.parse_also_on('"Stellenwerk"'), [])        # a bare string is not split into characters
 
 
 class FitPanelTests(unittest.TestCase):

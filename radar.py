@@ -451,8 +451,7 @@ def open_db() -> sqlite3.Connection:
                             ("resume_versions", "label", "TEXT"), ("resume_versions", "keep", "INTEGER NOT NULL DEFAULT 0")):
         if col not in {r["name"] for r in db.execute(f"PRAGMA table_info({table})")}:
             db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
-    if "also_on" not in cols:
-        db.execute("ALTER TABLE jobs ADD COLUMN also_on TEXT")  # JSON list of other sources the same posting was seen on
+    add_column(db, "jobs", "also_on", "TEXT")  # JSON list of other sources the same posting was seen on
     if "distance_km" not in cols:
         db.execute("ALTER TABLE jobs ADD COLUMN distance_km REAL")
         for r in db.execute("SELECT id, description FROM jobs WHERE source = 'BA'").fetchall():
@@ -471,10 +470,37 @@ def dedup_key(company: str, title: str) -> str:
     return f"{norm(company)}|{norm(title)}"
 
 
+def add_column(db: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    """ALTER TABLE ... ADD COLUMN that survives two processes migrating at the same moment (the dashboard, the worker and
+    the daily run all call open_db when they start): the loser of the race gets 'duplicate column name', which is fine."""
+    if column in {r["name"] for r in db.execute(f"PRAGMA table_info({table})")}:
+        return
+    try:
+        db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+    except sqlite3.OperationalError as exc:
+        if "duplicate column" not in str(exc).lower():
+            raise
+
+
 def city_key(location: str | None) -> str:
-    """Normalised first part of a location ("Darmstadt, Hessen" -> "darmstadt"); empty when unknown."""
-    first = re.split(r"[,;/|(]", location or "", maxsplit=1)[0]
-    return re.sub(r"\s+", " ", _TITLE_NOISE.sub(" ", first.lower())).strip()
+    """Normalised city of a location, so spelling variants of one city agree: "Darmstadt, Hessen" -> "darmstadt",
+    "64283 Darmstadt" -> "darmstadt", "(Remote) Berlin" -> "berlin", "Frankfurt am Main" / "Frankfurt/Main" /
+    "Frankfurt (Main)" -> "frankfurt". Empty when unknown."""
+    text = (location or "").lower()
+    text = re.sub(r"^\s*(?:d-)?[0-9]{5}\s+", "", text)           # postal code prefix
+    text = re.sub(r"^(?:\s*\([^)]*\))+\s*", "", text)            # leading tags such as "(Remote)" or "(Hybrid)"
+    first = re.split(r"[,;/|(]", text, maxsplit=1)[0]
+    city = re.sub(r"\s+", " ", _TITLE_NOISE.sub(" ", first)).strip()
+    return re.sub(r"\s+(?:am|a)\s+m(?:ain)?$", "", city)         # "frankfurt am main" / "frankfurt a m" -> "frankfurt"
+
+
+def parse_also_on(raw) -> list[str]:
+    """The also_on column as a clean list of non-empty source names; anything that is not a JSON list of strings is empty."""
+    try:
+        data = json.loads(raw or "[]")
+    except (ValueError, TypeError):
+        return []
+    return [x.strip() for x in data if isinstance(x, str) and x.strip()] if isinstance(data, list) else []
 
 
 def _add_also_on(db: sqlite3.Connection, job_id: str, source: str) -> None:
@@ -482,36 +508,46 @@ def _add_also_on(db: sqlite3.Connection, job_id: str, source: str) -> None:
     row = db.execute("SELECT source, also_on FROM jobs WHERE id = ?", (job_id,)).fetchone()
     if row is None or not source or source == row["source"]:
         return
-    try:
-        seen = [str(x) for x in json.loads(row["also_on"] or "[]")]
-    except ValueError:
-        seen = []
+    seen = parse_also_on(row["also_on"])
     if source not in seen:
         db.execute("UPDATE jobs SET also_on = ? WHERE id = ?", (json.dumps(seen + [source], ensure_ascii=False), job_id))
 
 
 def store_new(db: sqlite3.Connection, jobs: list[dict]) -> None:
-    """Insert unseen jobs. A posting is a duplicate when company and title match AND the city matches (or one of the
-    two has no city, so we cannot tell them apart). The same generic title in two cities is kept as two jobs."""
-    known: dict[str, list[tuple[str, str]]] = {}  # company|title -> [(job id, city)]
-    for r in db.execute("SELECT id, company, title, location FROM jobs"):
-        known.setdefault(dedup_key(r["company"], r["title"]), []).append((r["id"], city_key(r["location"])))
-    dropped = 0
-    for j in jobs:
-        key, city = dedup_key(j["company"], j["title"]), city_key(j.get("location"))
-        if db.execute("SELECT 1 FROM jobs WHERE id = ?", (j["id"],)).fetchone():
-            continue
-        match = next((m for m in known.get(key, []) if not city or not m[1] or m[1] == city), None) if j["company"] else None
-        if match:
-            dropped += 1
-            log(f"duplicate posting dropped: {j['id']} {j['title']!r} @ {j['company']!r} ({city or 'no city'}) matches {match[0]}")
-            _add_also_on(db, match[0], j.get("source", ""))
-            continue
-        known.setdefault(key, []).append((j["id"], city))
-        db.execute(
-            "INSERT OR IGNORE INTO jobs (id, source, title, company, location, distance_km, url, description) "
-            "VALUES (:id, :source, :title, :company, :location, :distance_km, :url, :description)", j)
-    db.commit()
+    """Insert unseen jobs, in one write transaction (so two runs cannot both insert the same posting). A posting is a
+    duplicate when company and title match AND the city matches; an exact city match wins, and a posting without a city
+    on either side falls back to company+title. A stored posting without a city is claimed by the first city that
+    matches it (its location is filled in), so it cannot swallow every other city for the same title afterwards."""
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        known: dict[str, list[list]] = {}  # company|title -> [[job id, city]]
+        for r in db.execute("SELECT id, company, title, location FROM jobs ORDER BY first_seen, id"):
+            known.setdefault(dedup_key(r["company"], r["title"]), []).append([r["id"], city_key(r["location"])])
+        dropped = 0
+        for j in jobs:
+            key, city = dedup_key(j["company"], j["title"]), city_key(j.get("location"))
+            if db.execute("SELECT 1 FROM jobs WHERE id = ?", (j["id"],)).fetchone():
+                continue
+            candidates = known.get(key, []) if j["company"] else []
+            match = (next((m for m in candidates if city and m[1] == city), None)
+                     or next((m for m in candidates if not city or not m[1]), None))
+            if match:
+                dropped += 1
+                log(f"duplicate posting dropped: {j['id']} {j['title']!r} @ {j['company']!r} ({city or 'no city'}) matches {match[0]}")
+                if city and not match[1]:
+                    match[1] = city
+                    db.execute("UPDATE jobs SET location = ?, distance_km = COALESCE(distance_km, ?) "
+                               "WHERE id = ? AND COALESCE(location, '') = ''", (j.get("location"), j.get("distance_km"), match[0]))
+                _add_also_on(db, match[0], j.get("source", ""))
+                continue
+            known.setdefault(key, []).append([j["id"], city])
+            db.execute(
+                "INSERT OR IGNORE INTO jobs (id, source, title, company, location, distance_km, url, description) "
+                "VALUES (:id, :source, :title, :company, :location, :distance_km, :url, :description)", j)
+        db.commit()
+    except BaseException:
+        db.rollback()
+        raise
     if dropped:
         log(f"dropped {dropped} duplicate postings (same company + title + city)")
 
