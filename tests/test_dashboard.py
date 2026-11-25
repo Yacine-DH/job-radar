@@ -260,6 +260,112 @@ class DemoTests(unittest.TestCase):
             self.assertNotIn(forbidden, blob)
 
 
+class ArchiveAndViewsTests(unittest.TestCase):
+    """Skipped jobs age out of every view after SKIP_DAYS; Applied/Skipped are reachable by a click; nothing is deleted."""
+
+    NOW = datetime(2026, 11, 25, 12, 0, tzinfo=d.BERLIN)
+
+    def r(self, status, days_ago=None, **kw):
+        at = None if days_ago is None else (self.NOW.astimezone(d.timezone.utc) - d.timedelta(days=days_ago)).strftime("%Y-%m-%d %H:%M:%S")
+        return Row(id="t:1", status=status, status_at=at, **kw)
+
+    def test_only_old_or_undated_skipped_jobs_are_archived(self):
+        self.assertFalse(d.is_archived(self.r("not_relevant", 6.9), self.NOW))
+        self.assertTrue(d.is_archived(self.r("not_relevant", 7.1), self.NOW))
+        self.assertTrue(d.is_archived(self.r("not_relevant", None), self.NOW))   # skipped before the timestamp existed
+        for st in ("new", "interested", "applied"):
+            self.assertFalse(d.is_archived(self.r(st, 400), self.NOW), st)        # an old application is never archived
+
+    def test_view_matrix(self):
+        ok = d.status_ok
+        self.assertTrue(ok("applied", "applied") and ok("applied", "all") and not ok("applied", "open"))
+        self.assertTrue(ok("not_relevant", "not_relevant") and ok("not_relevant", "all") and not ok("not_relevant", "active"))
+        for mode in ("all", "active", "open", "not_relevant"):
+            self.assertFalse(ok("not_relevant", mode, old=True), mode)   # archived jobs vanish from every normal view
+        self.assertTrue(ok("not_relevant", "archived", old=True))
+        self.assertFalse(ok("not_relevant", "archived", old=False))
+        self.assertFalse(ok("applied", "archived"))
+
+    def test_the_card_carries_the_archive_flag_for_the_client_side_filter(self):
+        from datetime import datetime as dt
+        old = Row(id="t:1", title="x", status="not_relevant", status_at="2020-01-01 00:00:00", score=40, first_seen="2026-01-01 00:00:00")
+        recent = Row(id="t:2", title="x", status="not_relevant", status_at=dt.now(d.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                     score=40, first_seen="2026-01-01 00:00:00")
+        self.assertIn('data-old="1"', d.render_card(old))
+        self.assertNotIn("data-old", d.render_card(recent))
+
+
+class FrontPageTests(unittest.TestCase):
+    """The whole front page rendered from the demo data (tiles, chips, counts)."""
+
+    class Req:
+        class state:
+            nonce = "n0nce"
+
+    def setUp(self):
+        import demo
+        from pathlib import Path
+        from unittest import mock
+        self._keep = fresh_db()
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old = radar.TAILORED_DIR
+        radar.TAILORED_DIR = Path(self._tmp.name)
+        self._conns = []
+
+        def connect():
+            con = sqlite3.connect(radar.DB_PATH, timeout=10)
+            con.row_factory = sqlite3.Row
+            self._conns.append(con)
+            return con
+
+        self._patch = mock.patch.object(d, "db", connect)
+        self._patch.start()
+        setup = radar.open_db()
+        demo.seed(radar, setup)
+        setup.close()
+
+    def tearDown(self):
+        self._patch.stop()
+        for con in self._conns:
+            con.close()
+        radar.TAILORED_DIR = self._old
+        self._tmp.cleanup()
+
+    def page(self, **kw):
+        args = dict(min_score=0, source="all", status="open", sort="score", q="")
+        args.update(kw)
+        return d.index(self.Req(), **args).body.decode()
+
+    def test_counters_are_buttons_and_the_chips_show_the_right_counts(self):
+        h = self.page()
+        for view in ("new", "all", "interested", "applied"):
+            self.assertRegex(h, rf'<button type="button" class="stat[^"]*" data-view="{view}">')
+            self.assertIn(f'data-view="{view}"', h)
+        self.assertIn("Applied · 1", h)      # demo:5
+        self.assertIn("Skipped · 1", h)      # demo:6 (4 days ago); demo:8 was skipped 10 days ago and is archived
+        self.assertIn("Archived · 1", h)
+        self.assertIn('data-chip="archived"', h)
+
+    def test_the_archived_job_is_flagged_and_not_counted_as_tracked(self):
+        import demo
+        h = self.page()
+        self.assertEqual(h.count('data-old="1"'), 1)
+        self.assertIn(f'data-total="{len(demo.JOBS) - 1}"', h)     # 'tracked' excludes the archived job
+
+    def test_the_server_side_views_show_applied_and_skipped_jobs_and_hide_the_archived_one_everywhere_else(self):
+        self.assertIn("Showing 1 of", self.page(status="applied"))
+        self.assertIn("Showing 1 of", self.page(status="not_relevant"))   # the recent skip only
+        self.assertIn("Showing 1 of", self.page(status="archived"))       # the 10-day-old skip only
+        import demo
+        self.assertIn(f"Showing {len(demo.JOBS) - 1} of", self.page(status="all"))  # everything but the archived job
+
+    def test_the_script_knows_the_views_the_undo_toast_and_the_archive_flag(self):
+        h = self.page()
+        for needle in ("c.dataset.old==='1'", "showView(", "['Undo','undo']", "delete c.dataset.old",
+                       "okStatus=(s,m,old)"):
+            self.assertIn(needle, h)
+
+
 class RouteTests(unittest.TestCase):
     """The new JSON routes called directly (no HTTP server in the test environment): validation, origin check, persistence."""
 

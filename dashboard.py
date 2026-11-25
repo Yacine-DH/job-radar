@@ -36,7 +36,9 @@ BERLIN = ZoneInfo("Europe/Berlin")
 STATUSES = {"new": "New", "interested": "Interested", "applied": "Applied", "not_relevant": "Not relevant"}
 STATUS_ORDER = tuple(STATUSES)
 OPEN_STATUSES = ("new", "interested")  # "To triage": still needs a decision or an application
-VIEWS = {"open": "To triage", "active": "Active (hide not relevant)", "all": "All", **STATUSES}
+SKIP_DAYS = 7  # skipped jobs stay in the "Not relevant" view this long, then move to "Archived" (kept in the DB so
+# the radar never fetches them again as new)
+VIEWS = {"open": "To triage", "active": "Active (hide not relevant)", "all": "All", **STATUSES, "archived": f"Archived (skipped over {SKIP_DAYS} days ago)"}
 SORTS = {"score": "Best fit first", "new": "Newest first"}
 TAILSCALE_V4 = ipaddress.ip_network("100.64.0.0/10")
 TAILSCALE_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
@@ -292,7 +294,20 @@ def band(score) -> str:
 BAND_WORD = {"hi": "high", "mid": "medium", "lo": "low"}
 
 
-def status_ok(st: str, mode: str) -> bool:
+def is_archived(r, now: datetime | None = None) -> bool:
+    """A skipped job older than SKIP_DAYS (or skipped before the timestamp existed) is archived: hidden from every view
+    except 'Archived'. Changing its status again stamps a new time and brings it back."""
+    if r["status"] != "not_relevant":
+        return False
+    at = parse_ts(r["status_at"])
+    return at is None or (now or datetime.now(BERLIN)) - at > timedelta(days=SKIP_DAYS)
+
+
+def status_ok(st: str, mode: str, old: bool = False) -> bool:
+    if mode == "archived":
+        return old
+    if old:
+        return False
     return (mode == "all" or (mode == "open" and st in OPEN_STATUSES)
             or (mode == "active" and st != "not_relevant") or st == mode)
 
@@ -702,7 +717,7 @@ def render_card(r, hidden: bool = False, versions: list | None = None) -> str:
     desc = (r["description"] or "").strip()
     title = r["title"] or ""
     return f"""<article class="card" data-id="{e(r['id'], quote=True)}" data-score="{'' if score is None else score}" \
-data-source="{e(r['source'] or '', quote=True)}" data-status="{e(r['status'], quote=True)}" \
+data-source="{e(r['source'] or '', quote=True)}" data-status="{e(r['status'], quote=True)}"{' data-old="1"' if is_archived(r) else ''} \
 data-first="{e(r['first_seen'] or '', quote=True)}"{' hidden' if hidden else ''}>
   <div class="head">{badge}<div class="ttl"><a class="title" href="{e(safe_url(r['url']), quote=True)}" target="_blank" rel="noopener noreferrer">{e(title)}</a>{'<span class="pill">NEW</span>' if fresh else ''}<span class="co">{e(r['company'] or '')}</span></div></div>
   <div class="rest">
@@ -739,6 +754,7 @@ kbd{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);bor
 .brand{display:flex;align-items:center;gap:8px;color:var(--accent)}.brand h1{margin:0;font-size:18px;font-weight:650;letter-spacing:-.01em;color:var(--fg)}
 .lastrun{font-size:13px;color:var(--muted)}.lr-long{display:none}
 .stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+button.stat{font:inherit;color:inherit;border:0;text-align:left;cursor:pointer}.stat:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
 .stat{background:var(--bg);border-radius:8px;padding:8px 10px}.stat b{display:block;font-size:20px;font-weight:650;line-height:1.1}
 .stat span{font-size:12px;color:var(--muted)}.stat.hot{background:var(--accent-tint)}.stat.hot b,.stat.hot span{color:var(--accent-fg)}.stat.tracked{display:none}
 .back{width:40px;height:40px;margin-left:-10px;display:flex;align-items:center;justify-content:center;color:var(--fg)}
@@ -867,6 +883,7 @@ dl.keys{margin:0;display:grid;grid-template-columns:auto minmax(0,1fr);gap:6px 1
 .rhead{display:flex;align-items:center;gap:8px}.rhead .t{font-size:17px;font-weight:650}.rhead .s{font-size:13px;color:var(--muted)}
 #toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:var(--fg);color:var(--card);padding:10px 16px;border-radius:8px;font-size:14px;max-width:calc(100vw - 32px);z-index:10}
 #toast[hidden]{display:none}
+#toast .lnk{color:inherit;font-weight:600;text-decoration:underline;min-height:32px;padding:0 6px}
 @media (min-width:1000px){
   .top .in{flex-direction:row;align-items:center;gap:24px;padding:14px 16px}.bar1{display:contents}
   .lr-short{display:none}.lr-long{display:inline}.lastrun{margin-left:auto;order:3}
@@ -892,13 +909,16 @@ const list=$('#list');if(!list)return;
 const more=$('#more'),showing=$('#showing'),empty=$('#empty'),toast=$('#toast'),total=+list.dataset.total;
 const ctl={min:$('#f-min'),source:$('#f-source'),status:$('#f-status'),q:$('#f-q'),sort:$('#f-sort')};
 const OPEN=['new','interested'],undo=[];let cur=null,toastT=0;
-const say=m=>{toast.textContent=m;toast.hidden=false;clearTimeout(toastT);toastT=setTimeout(()=>toast.hidden=true,4500);};
-const okStatus=(s,m)=>m==='all'||(m==='open'&&OPEN.includes(s))||(m==='active'&&s!=='not_relevant')||m===s;
+const say=(m,acts)=>{toast.textContent=m;(acts||[]).forEach(a=>{const b=document.createElement('button');b.type='button';b.className='lnk';
+  b.textContent=a[0];b.dataset.act=a[1];if(a[2])b.dataset.view=a[2];toast.append(' ',b);});
+  toast.hidden=false;clearTimeout(toastT);toastT=setTimeout(()=>toast.hidden=true,acts&&acts.length?9000:4500);};
+const okStatus=(s,m,old)=>m==='archived'?!!old:!old&&(m==='all'||(m==='open'&&OPEN.includes(s))||(m==='active'&&s!=='not_relevant')||m===s);
+const VIEWNAME={new:'New',interested:'Interested',applied:'Applied',not_relevant:'Skipped'};
 const cards=()=>$$('.card',list);
 const row=c=>{const n=c.nextElementSibling;return n&&n.classList.contains('collapsed')?n:null;};
 function matches(c,f){
   const sc=c.dataset.score===''?0:+c.dataset.score;
-  return sc>=f.min&&(f.source==='all'||c.dataset.source===f.source)&&okStatus(c.dataset.status,f.status)&&
+  return sc>=f.min&&(f.source==='all'||c.dataset.source===f.source)&&okStatus(c.dataset.status,f.status,c.dataset.old==='1')&&
     (!f.q||c.textContent.toLowerCase().includes(f.q));
 }
 const filt=()=>({min:+ctl.min.value,source:ctl.source.value,status:ctl.status.value,q:ctl.q.value.trim().toLowerCase(),sort:ctl.sort.value});
@@ -932,7 +952,7 @@ function apply(){
   $('#f-min-out').textContent=f.min;
   showing.textContent='Showing '+shown+' of '+total;
   $$('[data-chip]').forEach(b=>b.setAttribute('aria-pressed',String(
-    b.dataset.chip==='triage'?f.status==='open':b.dataset.chip==='interested'?f.status==='interested':f.min>=70)));
+    b.dataset.chip==='triage'?f.status==='open':b.dataset.chip==='s70'?f.min>=70:b.dataset.chip===f.status)));
   showEmpty(shown,f);
   const u=new URLSearchParams();
   if(f.status!=='open')u.set('status',f.status);if(f.min)u.set('min_score',f.min);if(f.source!=='all')u.set('source',f.source);
@@ -944,14 +964,17 @@ function collapse(c){c.dataset.skipped='1';c.hidden=true;c.classList.remove('kb'
 function expand(c){delete c.dataset.skipped;const r=row(c);if(r)r.hidden=true;c.hidden=false;}
 async function setStatus(c,s,undoing){
   const prev=c.dataset.status;if(prev===s)return;
-  setPressed(c,s);c.dataset.status=s;
+  setPressed(c,s);c.dataset.status=s;delete c.dataset.old;  // a new decision restarts the archive clock
   if(undoing)expand(c);else if(s==='not_relevant')collapse(c);
   try{
     const r=await fetch('/api/status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:c.dataset.id,status:s})});
     if(!r.ok)throw new Error(r.status);
-    if(!undoing)undo.push({c,prev});
+    if(!undoing){undo.push({c,prev});
+      if(s!=='not_relevant'){apply();say('Marked as '+VIEWNAME[s]+(prev==='new'?'':' (was '+VIEWNAME[prev]+')'),[['Undo','undo'],...(okStatus(s,filt().status,false)?[]:[['View '+VIEWNAME[s].toLowerCase(),'view',s]])]);}}
+    else apply();
   }catch(err){setPressed(c,prev);c.dataset.status=prev;if(s==='not_relevant'&&!undoing)expand(c);say('Could not save status ('+err.message+')');}
 }
+function showView(v){ctl.status.value=v;ctl.min.value=0;ctl.source.value='all';ctl.q.value='';apply();window.scrollTo({top:0,behavior:'smooth'});}
 function doUndo(){const u=undo.pop();if(u)setStatus(u.c,u.prev,true);else say('Nothing to undo');}
 async function refreshTailor(c){
   try{
@@ -996,14 +1019,17 @@ document.addEventListener('click',e=>{
       deleteVersions(c,{n:+d.n},'Delete version v'+d.n+(d.pinned==='1'?' (pinned: you labelled it to keep it)':'')+(d.cur==='1'?(d.prev==='1'?', your CURRENT resume? The previous version becomes current':', your only resume? The resume for this job will be removed'):'? ')+'. This cannot be undone.');}
     else if(a.dataset.act==='resume-delete-older'&&c)deleteVersions(c,{all_older:true},'Delete all older versions except the newest and the pinned ones? This cannot be undone.');
     else if(a.dataset.act==='undo')doUndo();
+    else if(a.dataset.act==='view'){showView(a.dataset.view);toast.hidden=true;}
     else if(a.dataset.act==='details'&&c){const d=$('.desc',c),open=d.hidden;d.hidden=!open;a.setAttribute('aria-expanded',String(open));}
     else if(a.dataset.act==='more'){const o=more.classList.toggle('open');a.setAttribute('aria-expanded',String(o));}
     return;
   }
+  const vw=t.closest('[data-view]:not([data-act])');if(vw){showView(vw.dataset.view);return;}
   const ch=t.closest('[data-chip]');
   if(ch){const n=ch.dataset.chip;
     if(n==='triage')ctl.status.value='open';
-    else if(n==='interested')ctl.status.value=ctl.status.value==='interested'?'open':'interested';
+    else if(n==='s70')ctl.min.value=+ctl.min.value>=70?0:70;
+    else if(n!=='s70'&&VIEWNAME[n]||n==='archived')ctl.status.value=ctl.status.value===n?'open':n;
     else ctl.min.value=+ctl.min.value>=70?0:70;
     apply();return;}
   const fx=t.closest('[data-fix]');
@@ -1074,13 +1100,16 @@ def index(request: Request, min_score: int = Query(0, ge=0, le=100), source: str
         sources = [r[0] for r in con.execute("SELECT DISTINCT source FROM jobs ORDER BY source")]
         order = ("COALESCE(score, -1) DESC, first_seen DESC" if sort != "new" else "first_seen DESC, COALESCE(score, -1) DESC")
         rows = con.execute(f"{ROW_SQL} ORDER BY {order}, jobs.id").fetchall()
-        counts = dict(con.execute("SELECT status, COUNT(*) FROM jobs GROUP BY status").fetchall())
         run = last_run(con)
         gaps = gap_stats(con)
         vers = versions_for(con)
         today = datetime.now(BERLIN).date()
         triaged = sum(1 for r in con.execute("SELECT status_at FROM jobs WHERE status != 'new' AND status_at IS NOT NULL")
                       if (parse_ts(r[0]) or datetime.min.replace(tzinfo=BERLIN)).date() == today)
+    now = datetime.now(BERLIN)
+    old_ids = {r["id"] for r in rows if is_archived(r, now)}
+    live = [r for r in rows if r["id"] not in old_ids]
+    counts = Counter(r["status"] for r in live)  # the counters never include archived jobs
     source = source if source in sources else "all"
     status = status if status in VIEWS else "open"
     sort = sort if sort in SORTS else "score"
@@ -1090,9 +1119,9 @@ def index(request: Request, min_score: int = Query(0, ge=0, le=100), source: str
     def visible(r) -> bool:
         sc = r["score"] or 0
         hay = " ".join(str(r[k] or "") for k in ("title", "company", "location", "description", "reason", "cv_track", "gaps")).lower()
-        return sc >= min_score and (source == "all" or r["source"] == source) and status_ok(r["status"], status) and (not ql or ql in hay)
+        return sc >= min_score and (source == "all" or r["source"] == source) and status_ok(r["status"], status, r["id"] in old_ids) and (not ql or ql in hay)
 
-    total = len(rows)
+    total = len(live)
     shown = sum(1 for r in rows if visible(r))
     triage_n = counts.get("new", 0) + counts.get("interested", 0)
     nxt = next_run_text()
@@ -1102,10 +1131,10 @@ def index(request: Request, min_score: int = Query(0, ge=0, le=100), source: str
     header = f"""<header class="top"><div class="in">
   <div class="bar1"><div class="brand">{icon("radar", 22)}<h1>Job Radar</h1></div>
     <span class="lastrun"><span class="lr-short">{e(lr[0])}</span><span class="lr-long">{e(lr[1])}</span></span></div>
-  <div class="stats"><div class="stat hot"><b>{counts.get('new', 0)}</b><span>new</span></div>
-    <div class="stat tracked"><b>{total}</b><span>tracked</span></div>
-    <div class="stat"><b>{counts.get('interested', 0)}</b><span>interested</span></div>
-    <div class="stat"><b>{counts.get('applied', 0)}</b><span>applied</span></div></div>
+  <div class="stats"><button type="button" class="stat hot" data-view="new"><b>{counts.get('new', 0)}</b><span>new</span></button>
+    <button type="button" class="stat tracked" data-view="all"><b>{total}</b><span>tracked</span></button>
+    <button type="button" class="stat" data-view="interested"><b>{counts.get('interested', 0)}</b><span>interested</span></button>
+    <button type="button" class="stat" data-view="applied"><b>{counts.get('applied', 0)}</b><span>applied</span></button></div>
 </div></header>"""
 
     strip = (f'<a class="gapstrip" href="/gaps">{icon("chart", 18)}<span>{gap_strip_text(gaps["ranked"])}</span>{icon("chevron")}</a>'
@@ -1119,6 +1148,9 @@ def index(request: Request, min_score: int = Query(0, ge=0, le=100), source: str
     <button type="button" class="cb" data-chip="triage" aria-pressed="{str(status == 'open').lower()}">To triage · {triage_n}</button>
     <button type="button" class="cb" data-chip="s70" aria-pressed="{str(min_score >= 70).lower()}">Score ≥ 70</button>
     <button type="button" class="cb" data-chip="interested" aria-pressed="{str(status == 'interested').lower()}">Interested</button>
+    <button type="button" class="cb" data-chip="applied" aria-pressed="{str(status == 'applied').lower()}">Applied · {counts.get('applied', 0)}</button>
+    <button type="button" class="cb" data-chip="not_relevant" aria-pressed="{str(status == 'not_relevant').lower()}">Skipped · {counts.get('not_relevant', 0)}</button>
+    {f'<button type="button" class="cb" data-chip="archived" aria-pressed="{str(status == "archived").lower()}">Archived · {len(old_ids)}</button>' if old_ids else ''}
     <button type="button" class="cb more-btn" data-act="more" aria-expanded="false" aria-controls="more">{icon("sliders")}More</button>
   </div>
   <form id="more" class="more" method="get" action="/">

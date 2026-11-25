@@ -62,6 +62,8 @@ JOBS = [
      "Support work matches the current job, but it is not a developer role.", "swe", [], "applied", "BA", 3),
     ("demo:6", "Werkstudent Data Engineering", "Fiktiv Data GmbH", "Wiesbaden", 38, 49,
      "Right topics, but outside the 30 km radius for regular office days.", "ml", ["Spark", "Kafka"], "not_relevant", "Merck", 4),
+    ("demo:8", "Werkstudent PHP Webentwicklung", "Alt & Neu Medien GmbH", "Offenbach", 24, 41,
+     "Mostly PHP and WordPress; little overlap with the CV.", "swe", [], "not_relevant", "BA", 10),
     ("demo:7", "Praktikum Cloud Operations", "Platzhalter Cloud AG", "Darmstadt", 2, 58,
      "Cloud and Linux fit; it is an internship, not a Werkstudent role.", "devops", ["AWS"], "new", "SmartRecruiters", 2),
 ]
@@ -78,10 +80,10 @@ def seed(radar, db) -> None:
     for jid, title, company, loc, km, score, reason, track, gaps, status, source, days in JOBS:
         db.execute(
             "INSERT INTO jobs (id, source, title, company, location, distance_km, url, description, first_seen, score, reason,"
-            " cv_track, gaps, status, notified) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)",
+            " cv_track, gaps, status, status_at, notified) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)",
             (jid, source, title, company, loc, km, "https://example.org/jobs/" + jid.split(":")[1],
              f"{title} at {company}. You work on real projects next to your studies, about 20 hours per week.",
-             ts(days), score, reason, track, json.dumps(gaps), status))
+             ts(days), score, reason, track, json.dumps(gaps), status, None if status == "new" else ts(days)))
     db.execute("INSERT INTO tailoring (job_id, track, markdown) VALUES ('demo:1', 'devops', ?)", (FIT,))
     token = radar.file_token("demo:1")
     radar.TAILORED_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
