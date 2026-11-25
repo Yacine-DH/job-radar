@@ -601,8 +601,10 @@ class DownloadRouteTests(unittest.TestCase):
         self.assertEqual(res.status_code, 200)
         self.assertIn(f'filename="resume-{self.token}.pdf"', res.headers["content-disposition"])
 
-    def test_unicode_digit_versions_are_404_in_the_route(self):
-        self.assertEqual(self.get(self.token + ".v\u0662.pdf").status_code, 404)
+    def test_unicode_digit_versions_are_404_in_the_route_even_when_such_a_file_exists(self):
+        for digits in ("\u0662", "1\u0662"):                          # first position, and after an ASCII digit (the \d{0,5} part)
+            (radar.TAILORED_DIR / f"{self.token}.v{digits}.pdf").write_bytes(b"x")   # so only the whitelist can say no
+            self.assertEqual(self.get(f"{self.token}.v{digits}.pdf").status_code, 404, digits)
 
     def test_path_traversal_and_odd_names_still_404(self):
         for bad in ("../" + self.token + ".pdf", self.token + ".pdf/../x", "%2e%2e%2f" + self.token + ".pdf", self.token + ".exe",
