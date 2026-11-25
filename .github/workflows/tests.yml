@@ -1,0 +1,40 @@
+name: Tests
+
+# Runs the offline unit tests on every push and pull request. No secrets, no network, no CV: the suite only
+# uses made-up data (see tests/helpers.py).
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install the dashboard's dependencies (radar, cv and worker use only the standard library)
+        run: python -m pip install -r requirements.txt
+
+      - name: Every top-level module compiles
+        run: python -m py_compile radar.py cv.py worker.py dashboard.py demo.py
+
+      - name: Unit tests (a ResourceWarning fails the run, as locally)
+        run: python -W error::ResourceWarning -m unittest discover -s tests -t . -v

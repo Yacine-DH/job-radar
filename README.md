@@ -126,7 +126,7 @@ python3 -I cv.py recompile             # build missing PDFs from .tex files alre
 python3 -I cv.py skills                # most demanded skills your CV lacks
 journalctl --user -u job-radar.service # logs of the daily run
 
-.venv/bin/python -m unittest discover -s tests -t .    # tests
+.venv/bin/python -W error::ResourceWarning -m unittest discover -s tests -t .    # tests (CI runs exactly this)
 ```
 
 ## Configuration (`.env`)
