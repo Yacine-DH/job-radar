@@ -14,12 +14,14 @@ repo with the unscrubbed history is archived as `Yacine-DH/job-radar-archive`.
 - `radar.py` - fetchers (BA Jobsuche v6, Stellenwerk, Merck/Phenom JSON, Arbeitnow, SmartRecruiters via
   `sources.json`), CS filter, SQLite store + dedupe, ranking, HTML email. Daily entry point.
 - `cv.py` - `build` (distill CV -> `cv/profile.md`), `tailor`, `resume` (tailored one-page LaTeX), `skills`.
-- `worker.py` - polls the `tailor_jobs` queue and runs `cv.run_request` (the dashboard cannot run `claude`).
+- `worker.py` - heartbeats while polling the `tailor_jobs` queue, recovers stale requests and runs `cv.run_request`
+  (the dashboard cannot run `claude`).
 - `dashboard.py` - FastAPI, f-string HTML, one nonce'd inline script, no build step. Implements the redesign in
   `docs/design-handoff.md`: client-side filters (chips, min score, source, status, search, sort; URL params are
   the no-JS fallback), optimistic status buttons with Skip/Undo, keyboard (j/k/1-4/o/t/u), tailor slot swapped
   in place via `/api/tailor/fragment` polling, `/gaps` weekly skill-gap report, desktop sidebar, empty states.
-  Routes: `/`, `/gaps`, `/api/status`, `/api/tailor`, `/api/tailor/status`, `/api/tailor/fragment`, `/files/<token>.pdf|tex`.
+  Routes: `/`, `/gaps`, `/api/status`, `/api/tailor`, `/api/tailor/cancel`, `/api/tailor/status`, `/api/tailor/fragment`,
+  `/files/<token>.pdf|tex`.
 - `systemd/` - the units (`job-radar.timer|service`, `job-radar-dashboard.service`, `job-radar-worker.service`) and
   `install.sh`, which links and enables them (idempotent). They are symlinked into `~/.config/systemd/user`, so
   moving a unit file breaks the links: re-run `systemd/install.sh`. After editing a unit: `daemon-reload` + restart.
@@ -80,7 +82,8 @@ ask the owner which one to use. (An earlier version hard-coded the address in th
 ## Data model (`jobs.db`)
 `jobs` (id `source:ref`, score, reason, cv_track swe|devops|ml, gaps JSON, status new|interested|applied|
 not_relevant, notified, distance_km...), `tailoring` (markdown analysis per job), `tailor_jobs` (queue:
-queued|running|done|failed, pdf flag, warnings JSON), `resume_versions` (every successful resume generation is
+queued|running|done|failed|cancelled, request and start timestamps, attempt number, pdf flag, warnings JSON),
+`worker_heartbeat` (the worker's latest UTC heartbeat), `resume_versions` (every successful resume generation is
 archived as `cv/tailored/<token>.v<N>.tex|pdf`, last 10 kept, lazy v1 backfill before the first overwrite; the dashboard
 shows a collapsed **History (N)** control), `runs` (one row per real daily run: per-source counts and
 failed sources, shown in the dashboard header/sidebar; dry runs do not write it). Ranking prompts include the

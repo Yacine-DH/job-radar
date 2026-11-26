@@ -114,13 +114,20 @@ class TailorRequest(BaseModel):
     notes: str = ""      # what to change (instructions for this one resume)
     base: int | None = Field(default=None, ge=1, le=2**31 - 1)  # archived version to edit; None = start from the master CV
     label: str = ""      # names and pins the resulting version, e.g. "final"
+    retry: bool = False
+
+
+class TailorCancel(BaseModel):
+    id: str
 
 
 MAX_QUEUED = 5
 
 ROW_SQL = (
     "SELECT jobs.*, t.markdown AS tailoring_md, tj.state AS tj_state, tj.pdf AS tj_pdf, "
-    "tj.warnings AS tj_warnings, tj.error AS tj_error, tj.requested AS tj_requested, tj.finished AS tj_finished "
+    "tj.warnings AS tj_warnings, tj.error AS tj_error, tj.requested AS tj_requested, "
+    "tj.started AS tj_started, tj.finished AS tj_finished, "
+    "(SELECT updated FROM worker_heartbeat WHERE id = 1) AS tj_heartbeat "
     "FROM jobs LEFT JOIN tailoring t ON t.job_id = jobs.id LEFT JOIN tailor_jobs tj ON tj.job_id = jobs.id")
 
 
@@ -165,6 +172,10 @@ async def _request_tailor(body: TailorRequest, request: Request):
             return JSONResponse({"error": "unknown job"}, status_code=404)
         row = con.execute("SELECT state FROM tailor_jobs WHERE job_id = ?", (body.id,)).fetchone()
         if row and row["state"] in ("queued", "running"):
+            if body.retry:
+                con.execute("UPDATE tailor_jobs SET state = 'queued', requested = CURRENT_TIMESTAMP, started = NULL, "
+                            "finished = NULL, error = NULL WHERE job_id = ?", (body.id,))
+                return {"state": "queued"}
             return {"state": row["state"]}
         if con.execute("SELECT COUNT(*) FROM tailor_jobs WHERE state IN ('queued','running')").fetchone()[0] >= MAX_QUEUED:
             return JSONResponse({"error": "queue is full, try again in a few minutes"}, status_code=429)
@@ -178,6 +189,30 @@ async def _request_tailor(body: TailorRequest, request: Request):
             "notes = excluded.notes, base_n = excluded.base_n, label = excluded.label",
             (body.id, body.notes.strip() or None, body.base, body.label.strip() or None))
     return {"state": "queued"}
+
+
+@app.post("/api/tailor/cancel")
+async def cancel_tailor(body: TailorCancel, request: Request):
+    try:
+        return await _cancel_tailor(body, request)
+    except sqlite3.OperationalError as exc:
+        return busy(exc)
+
+
+async def _cancel_tailor(body: TailorCancel, request: Request):
+    origin = request.headers.get("origin")
+    if origin and urlsplit(origin).netloc.lower() not in allowed_hosts():
+        return JSONResponse({"error": "bad origin"}, status_code=403)
+    with db() as con:
+        con.execute("BEGIN IMMEDIATE")
+        cur = con.execute("UPDATE tailor_jobs SET state = 'cancelled', finished = CURRENT_TIMESTAMP "
+                          "WHERE job_id = ? AND state IN ('queued', 'running')", (body.id,))
+        if cur.rowcount:
+            return {"state": "cancelled"}
+        row = con.execute("SELECT state FROM tailor_jobs WHERE job_id = ?", (body.id,)).fetchone()
+    if row is None:
+        return JSONResponse({"error": "unknown request"}, status_code=404)
+    return JSONResponse({"error": f"request is already {row['state']}"}, status_code=409)
 
 
 class DeleteVersions(BaseModel):
@@ -629,17 +664,41 @@ def render_regen(r, versions: list | None) -> str:
             '<button type="button" class="btn primary" data-act="regen-go">Generate</button></div></details>')
 
 
-def render_tailor(r, versions: list | None = None) -> str:
+def render_tailor(r, versions: list | None = None, now: datetime | None = None) -> str:
     """The tailor slot of a card (swapped in place by the page while a request is pending)."""
     state, token = r["tj_state"], radar.file_token(r["id"])
+    now = now or datetime.now(timezone.utc)
     box, idle = "", state is None
     if state in ("queued", "running"):
-        started = fmt_hm(r["tj_requested"])
+        started = fmt_hm(r["tj_started"] or r["tj_requested"])
+        time_label = "Started" if state == "running" else "Queued"
+        requested_at = parse_ts(r["tj_requested"])
+        elapsed = (now - requested_at).total_seconds() if requested_at else 0
+        slow = elapsed >= 300
         what = "Waiting in the queue…" if state == "queued" else "Tailoring resume…"
-        box = (f'<div class="box pend" role="status"><div class="prow"><span class="spin" aria-hidden="true"></span>'
-               f'<span>{what} <span class="muted">usually about a minute</span></span></div>'
-               f'<div class="bar"><i></i></div><span class="small muted">{"Started " + started + " · " if started else ""}'
-               "you can keep triaging; this card updates on its own.</span></div>")
+        if slow:
+            box = ('<div class="box pend" role="alert"><div class="prow"><strong>Taking longer than expected.</strong></div>'
+                   '<span class="small muted">You can retry this request or cancel it.</span>'
+                   '<div class="actions"><button type="button" class="btn" data-act="tailor-retry">Retry</button>'
+                   '<button type="button" class="btn" data-act="tailor-cancel">Cancel</button></div></div>')
+        else:
+            box = (f'<div class="box pend" role="status"><div class="prow"><span class="spin" aria-hidden="true"></span>'
+                   f'<span>{what} <span class="muted">usually about a minute</span></span></div>'
+                   f'<div class="bar"><i></i></div><span class="small muted">{time_label + " " + started + " · " if started else ""}'
+                   "you can keep triaging; this card updates on its own.</span>"
+                   '<div class="actions"><button type="button" class="btn" data-act="tailor-cancel">Cancel</button></div></div>')
+        heartbeat = r["tj_heartbeat"]
+        heartbeat_at = parse_ts(heartbeat)
+        if heartbeat_at is None:
+            box += ('<div class="box warn" role="status">Worker has not checked in yet; '
+                    "your request will run when it is back.</div>")
+        else:
+            if now - heartbeat_at > timedelta(seconds=30):
+                box += (f'<div class="box warn" role="status">Worker offline since {e(fmt_hm(heartbeat))}; '
+                        "your request will run when it is back.</div>")
+    elif state == "cancelled":
+        box = '<div class="box" role="status">Request cancelled.</div>'
+        idle = True
     elif state == "failed":
         box = (f'<div class="box fail" role="alert"><div class="frow">{icon("xcircle", 18)}<div>'
                f'<strong>Couldn\'t tailor this resume.</strong><div class="mono">{e(r["tj_error"] or "unknown error")}</div>'
@@ -802,6 +861,7 @@ main{padding:8px 16px 24px;display:flex;flex-direction:column;gap:12px}
 .prow{display:flex;align-items:center;gap:10px}
 .spin{width:18px;height:18px;border:2.6px solid var(--line);border-top-color:var(--accent);border-radius:50%;display:inline-block;animation:spin 1s linear infinite}
 .bar{height:4px;border-radius:2px;background:var(--line);overflow:hidden}.bar i{display:block;width:40%;height:4px;background:var(--accent);animation:slide 1.6s ease-in-out infinite alternate}
+.box .actions{display:flex;flex-wrap:wrap;gap:8px}
 @keyframes spin{to{transform:rotate(360deg)}}@keyframes slide{from{transform:translateX(0)}to{transform:translateX(150%)}}
 .stamp{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted)}.stamp .ic{color:var(--high)}.stamp.amber .ic{color:var(--mid)}
 .dl{display:flex;gap:8px;flex-wrap:wrap}
@@ -988,8 +1048,16 @@ async function startTailor(c,opts){
   try{
     const r=await fetch('/api/tailor',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:c.dataset.id,...(opts||{})})});
     if(!r.ok){const j=await r.json().catch(()=>({}));throw new Error(j.error||r.status);}
-    c.dataset.t0=Date.now();await refreshTailor(c);
+    await refreshTailor(c);
   }catch(err){say('Could not start: '+err.message);}
+}
+async function cancelTailor(c){
+  try{
+    const r=await fetch('/api/tailor/cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:c.dataset.id})});
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok)throw new Error(j.error||r.status);
+    await refreshTailor(c);
+  }catch(err){say('Could not cancel: '+err.message);}
 }
 async function deleteVersions(c,payload,msg){
   if(!confirm(msg))return;
@@ -1012,6 +1080,8 @@ document.addEventListener('click',e=>{
   if(a){
     const c=a.closest('.card')||(a.closest('.collapsed')&&list.querySelector('.card[data-id="'+CSS.escape(a.closest('.collapsed').dataset.for)+'"]'));
     if(a.dataset.act==='tailor'&&c)startTailor(c);
+    else if(a.dataset.act==='tailor-retry'&&c)startTailor(c,{retry:true});
+    else if(a.dataset.act==='tailor-cancel'&&c)cancelTailor(c);
     else if(a.dataset.act==='regen-go'&&c){
       const box=a.closest('.regen'),notes=$('[data-f=notes]',box).value.trim(),base=$('[data-f=base]',box).value,label=$('[data-f=label]',box).value.trim();
       const o={notes,label};if(notes&&base!=='')o.base=+base;startTailor(c,o);}
@@ -1055,8 +1125,7 @@ document.addEventListener('keydown',e=>{
 setInterval(()=>{
   for(const c of $$('.card')){
     if(!$('.tailor[data-pending]',c))continue;
-    const t0=+(c.dataset.t0||(c.dataset.t0=Date.now()));
-    if(Date.now()-t0<300000)refreshTailor(c);
+    refreshTailor(c);
   }
 },4000);
 apply();

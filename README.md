@@ -62,7 +62,9 @@ The demo cannot generate resumes (that needs your own CV and `claude`); it shows
 - **Emails** a digest every weekday at 08:00 (even when nothing is new, so you know it ran; failed sources are named).
 - **Tailors** a one-page resume per posting from your master CV. The model only picks and orders what the CV already
   says: every link must exist in the master, numbers and tool names are checked against it, language levels are
-  verified, and anything unsupported is flagged for you before you send it.
+  verified, and anything unsupported is flagged for you before you send it. The dashboard reports when its worker is
+  offline or a request is taking longer than expected, and lets you retry or cancel it; stale running requests are
+  requeued automatically.
 - **Keeps history:** every generated resume is archived as a numbered version. Regenerate from scratch or edit a chosen
   version with instructions; label a version to pin it; delete any version you do not want.
 - **Shows the gaps:** a weekly report of the skills your CV lacks that postings ask for most.
