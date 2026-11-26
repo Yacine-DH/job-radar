@@ -441,13 +441,17 @@ def open_db() -> sqlite3.Connection:
         id INTEGER PRIMARY KEY, ts TEXT DEFAULT CURRENT_TIMESTAMP, counts TEXT, failed TEXT)""")
     db.execute("""CREATE TABLE IF NOT EXISTS tailor_jobs (
         job_id TEXT PRIMARY KEY, state TEXT NOT NULL, requested TEXT DEFAULT CURRENT_TIMESTAMP,
-        finished TEXT, error TEXT, pdf INTEGER NOT NULL DEFAULT 0, warnings TEXT)""")
+        finished TEXT, error TEXT, pdf INTEGER NOT NULL DEFAULT 0, warnings TEXT,
+        started TEXT, attempt INTEGER NOT NULL DEFAULT 0)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS worker_heartbeat (
+        id INTEGER PRIMARY KEY CHECK (id = 1), updated TEXT NOT NULL)""")
     # Every successful resume generation is archived as a numbered version (see cv.snapshot_version).
     db.execute("""CREATE TABLE IF NOT EXISTS resume_versions (
         job_id TEXT NOT NULL, n INTEGER NOT NULL, created TEXT DEFAULT CURRENT_TIMESTAMP,
         role TEXT, lang TEXT, pdf INTEGER NOT NULL DEFAULT 0, warnings TEXT, PRIMARY KEY (job_id, n))""")
     # Owner instructions, the version to edit and a label for the result travel with a queued request; a label pins a version.
     for table, col, ddl in (("tailor_jobs", "notes", "TEXT"), ("tailor_jobs", "base_n", "INTEGER"), ("tailor_jobs", "label", "TEXT"),
+                            ("tailor_jobs", "started", "TEXT"), ("tailor_jobs", "attempt", "INTEGER NOT NULL DEFAULT 0"),
                             ("resume_versions", "label", "TEXT"), ("resume_versions", "keep", "INTEGER NOT NULL DEFAULT 0")):
         if col not in {r["name"] for r in db.execute(f"PRAGMA table_info({table})")}:
             db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")

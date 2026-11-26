@@ -69,6 +69,46 @@ class RenderingTests(unittest.TestCase):
         self.assertIn('role="alert"', failed)
         self.assertIn("&lt;boom&gt;", failed)
 
+    def test_pending_tailor_reports_worker_offline_with_a_status_role(self):
+        now = datetime(2026, 11, 26, 10, 0, tzinfo=d.timezone.utc)
+        out = d.render_tailor(Row(id="t:1", tj_state="queued", tj_requested="2026-11-26 09:59:00",
+                                  tj_heartbeat="2026-11-26 09:59:29"), now=now)
+
+        self.assertIn("Worker offline since 10:59", out)
+        self.assertIn('role="status"', out)
+        self.assertIn("your request will run when it is back", out)
+
+    def test_worker_is_not_offline_at_the_thirty_second_boundary(self):
+        now = datetime(2026, 11, 26, 10, 0, tzinfo=d.timezone.utc)
+        out = d.render_tailor(Row(id="t:1", tj_state="queued", tj_requested="2026-11-26 09:59:00",
+                                  tj_heartbeat="2026-11-26 09:59:30"), now=now)
+
+        self.assertNotIn("Worker offline since", out)
+
+    def test_slow_tailor_shows_accessible_retry_and_cancel_actions(self):
+        now = datetime(2026, 11, 26, 10, 6, tzinfo=d.timezone.utc)
+        out = d.render_tailor(Row(id="t:1", tj_state="running", tj_requested="2026-11-26 10:00:00",
+                                  tj_heartbeat="2026-11-26 10:05:59"), now=now)
+
+        self.assertIn("Taking longer than expected", out)
+        self.assertIn('role="alert"', out)
+        self.assertIn('data-act="tailor-retry"', out)
+        self.assertIn('data-act="tailor-cancel"', out)
+
+    def test_slow_state_starts_at_five_minutes(self):
+        now = datetime(2026, 11, 26, 10, 5, tzinfo=d.timezone.utc)
+        out = d.render_tailor(Row(id="t:1", tj_state="queued", tj_requested="2026-11-26 10:00:00",
+                                  tj_heartbeat="2026-11-26 10:04:59"), now=now)
+
+        self.assertIn("Taking longer than expected", out)
+
+    def test_cancelled_tailor_has_a_status_and_can_be_started_again(self):
+        out = d.render_tailor(Row(id="t:1", tj_state="cancelled"))
+
+        self.assertIn('role="status"', out)
+        self.assertIn("Request cancelled.", out)
+        self.assertIn('data-act="tailor"', out)
+
     def test_done_state_with_pdf_and_warnings(self):
         warnings = json.dumps(["Not found in your master CV, please verify: Kubernetes, Terraform"])
         out = d.render_tailor(Row(id="t:1", score=78, tj_state="done", tj_pdf=1, tj_warnings=warnings,
@@ -425,6 +465,30 @@ class RouteTests(unittest.TestCase):
         self.assertEqual((status, body), (200, {"state": "queued"}))
         self.assertEqual(self.row("SELECT notes, base_n, label, state FROM tailor_jobs"), ("swap A for B", 1, "final", "queued"))
 
+    def test_cancel_checks_origin_and_marks_active_requests_cancelled(self):
+        self.assertEqual(self.call(d.cancel_tailor, d.TailorCancel(id="t:1"), origin="http://evil.example")[0], 403)
+        self.assertEqual(self.call(d.request_tailor, d.TailorRequest(id="t:1"))[1], {"state": "queued"})
+
+        status, body = self.call(d.cancel_tailor, d.TailorCancel(id="t:1"))
+
+        self.assertEqual((status, body), (200, {"state": "cancelled"}))
+        self.assertEqual(self.row("SELECT state FROM tailor_jobs"), ("cancelled",))
+        self.assertEqual(self.call(d.cancel_tailor, d.TailorCancel(id="missing"))[0], 404)
+        self.assertEqual(self.call(d.cancel_tailor, d.TailorCancel(id="t:1"))[0], 409)
+
+    def test_retry_requeues_active_request_without_losing_its_options(self):
+        self.call(d.request_tailor, d.TailorRequest(id="t:1", notes="keep these", base=1, label="final"))
+        con = sqlite3.connect(radar.DB_PATH)
+        con.execute("UPDATE tailor_jobs SET state = 'running', started = CURRENT_TIMESTAMP, attempt = 1")
+        con.commit()
+        con.close()
+
+        status, body = self.call(d.request_tailor, d.TailorRequest(id="t:1", retry=True))
+
+        self.assertEqual((status, body), (200, {"state": "queued"}))
+        self.assertEqual(self.row("SELECT state, notes, base_n, label, started FROM tailor_jobs"),
+                         ("queued", "keep these", 1, "final", None))
+
     def test_bad_origin_unknown_version_missing_notes_and_bad_label_are_rejected(self):
         self.assertEqual(self.call(d.request_tailor, d.TailorRequest(id="t:1"), origin="http://evil.example")[0], 403)
         self.assertEqual(self.call(d.request_tailor, d.TailorRequest(id="t:1", notes="x", base=7))[0], 422)
@@ -488,8 +552,9 @@ class MigrationTests(unittest.TestCase):
         try:
             tj = {r["name"] for r in db.execute("PRAGMA table_info(tailor_jobs)")}
             rv = {r["name"] for r in db.execute("PRAGMA table_info(resume_versions)")}
-            self.assertLessEqual({"notes", "base_n", "label"}, tj)
+            self.assertLessEqual({"notes", "base_n", "label", "started", "attempt"}, tj)
             self.assertLessEqual({"label", "keep"}, rv)
+            self.assertIsNotNone(db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'worker_heartbeat'").fetchone())
             self.assertEqual(db.execute("SELECT keep, label FROM resume_versions").fetchone()[:], (0, None))
             self.assertEqual(db.execute("SELECT state FROM tailor_jobs").fetchone()[0], "done")
             radar.open_db().close()  # opening twice must not fail on the existing columns
